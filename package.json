@@ -1,0 +1,29 @@
+{
+  "name": "resumeauto",
+  "version": "7.0.0",
+  "description": "Gmail Bulk Email Sender — v7.0 TITAN with Smart Campaign Intelligence, A/B Testing, Multi-Account Deliverability & Glassmorphism Dashboard",
+  "main": "send_emails.js",
+  "scripts": {
+    "start": "node send_emails.js",
+    "dev": "nodemon send_emails.js",
+    "watch": "nodemon send_emails.js",
+    "build": "node --check send_emails.js && node test_engine.js && node test_server_e2e.js",
+    "test": "node test_engine.js && node test_server_e2e.js",
+    "clean": "node clean_emails.js",
+    "clean:gmail": "node clean_emails.js --allow-gmail",
+    "setup": "if not exist .env copy .env.example .env && echo Created .env file - please edit with your credentials"
+  },
+  "keywords": [],
+  "author": "Milin Chaware",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "imap": "^0.8.17",
+    "mailparser": "^3.9.20",
+    "nodemailer": "^9.1.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}

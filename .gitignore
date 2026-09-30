@@ -1,0 +1,55 @@
+# Environment Variables & Secrets
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+package-lock.json
+
+# Logs & Debugging
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+report.txt
+sent_log.txt
+
+# Runtime Data & Process IDs
+pids
+*.pid
+*.seed
+*.pid.lock
+progress.json
+
+# Sensitive Application Data & Recruiter Leads
+emails.txt
+settings.json
+jobs.json
+recruiters.json
+activity_log.json
+applications_log.csv
+inbox_activities.json
+interviews.json
+candidate_profile.json
+suppression_list.json
+goals.json
+
+# Resumes & Attachments
+*.pdf
+
+# Scratch & Temporary Testing Scripts
+scratch/
+
+# IDE & OS Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Build Outputs
+dist/
+build/

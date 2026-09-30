@@ -1,0 +1,4 @@
+# Format: email@company.com, Company Name
+# Or simply: email@company.com
+recruiter1@example.com, TechCorp
+recruiter2@example.com, Acme Solutions

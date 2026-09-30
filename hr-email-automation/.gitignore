@@ -1,0 +1,48 @@
+# ---- Credentials & Environment ----
+.env
+.env.local
+.env.*.local
+
+# ---- Database ----
+*.db
+*.sqlite
+*.sqlite3
+data/database/
+
+# ---- Logs ----
+logs/
+*.log
+
+# ---- Attachments (may contain private resumes) ----
+attachments/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ---- Virtual Environment ----
+venv/
+.venv/
+env/
+ENV/
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Testing ----
+.pytest_cache/
+htmlcov/
+.coverage
+.tox/

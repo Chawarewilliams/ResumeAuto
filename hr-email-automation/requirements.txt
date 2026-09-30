@@ -1,0 +1,11 @@
+# HR Email Automation System
+# Core dependencies
+python-dotenv>=1.1.0
+
+# Testing
+pytest>=8.0.0
+
+# Web UI (Phase 15 — install when needed)
+# fastapi>=0.115.0
+# uvicorn>=0.34.0
+# python-multipart>=0.0.20

@@ -1,0 +1,14 @@
+{
+  "watch": ["send_emails.js"],
+  "ignore": [
+    "*.txt",
+    "*.json",
+    "*.csv",
+    "*.pdf",
+    "*.bak",
+    "*.log",
+    "node_modules/**"
+  ],
+  "ext": "js",
+  "delay": 1000
+}

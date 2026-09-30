@@ -1,0 +1,8 @@
+email,hr_name,company,job_role
+hr@abc.com,Recruiter,ABC Technologies,Python Developer
+careers@xyz.com,HR Team,XYZ Solutions,Data Engineer
+hr@gmail.com,John,Unknown,Python Developer
+HR@ABC.COM,Recruiter,ABC Technologies,Python Developer
+invalid-email,Test,Test Company,Python Developer
+hr@company.in,Hiring Team,Company India,Backend Developer
+jobs@startup.io,,Startup IO,Full Stack Developer
