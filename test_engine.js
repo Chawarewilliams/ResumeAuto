@@ -16,6 +16,17 @@ const { selectOptimalResume } = require("./engine/resumeManager");
 const { renderTemplate } = require("./engine/templateEngine");
 const { ingestJobsFromSource } = require("./engine/sources");
 const { logActivity, queryActivityLogs } = require("./engine/activityLogger");
+const {
+  normalizeEmail,
+  validateSyntax,
+  isPersonalEmailDomain,
+  isDisposableEmailDomain,
+  acquireSendLock,
+  releaseSendLock,
+  hasActiveSendLock,
+  evaluateEmailSafety,
+  evaluateBatchSafety,
+} = require("./engine/safetyEngine");
 
 async function runTests() {
   console.log("🚀 Starting ResumeAuto Engine Test Suite...\n");
@@ -180,7 +191,26 @@ lead1@startup.io,Startup IO,Python Developer,Remote`; // intentional duplicate l
   console.log("  ✅ Activity logger successfully captured and indexed event");
   passed++;
 
-  console.log(`\n🎉 ALL ${passed}/9 ENGINE TESTS PASSED PERFECTLY!\n`);
+  // ─── 10. Email Safety Engine & In-Flight Send Lock ──────────
+  console.log("Test 10: Email Safety Engine & Concurrency Send Lock");
+  assert.strictEqual(normalizeEmail("  HR@Domain.COM  "), "hr@domain.com");
+  assert.strictEqual(isPersonalEmailDomain("gmail.com"), true);
+  assert.strictEqual(isPersonalEmailDomain("yahoo.com"), true);
+  assert.strictEqual(isPersonalEmailDomain("company.com"), false);
+
+  const lockTarget = "mutex.test@corp.com";
+  releaseSendLock(lockTarget);
+  const lock1 = acquireSendLock(lockTarget, { workerId: "worker-1" });
+  assert.strictEqual(lock1.acquired, true);
+  assert.strictEqual(hasActiveSendLock(lockTarget), true);
+  const lock2 = acquireSendLock(lockTarget, { workerId: "worker-2" });
+  assert.strictEqual(lock2.acquired, false); // blocked by mutex!
+  releaseSendLock(lockTarget);
+  assert.strictEqual(hasActiveSendLock(lockTarget), false);
+  console.log("  ✅ Central safety pipeline & concurrency send lock verified");
+  passed++;
+
+  console.log(`\n🎉 ALL ${passed}/10 ENGINE TESTS PASSED PERFECTLY!\n`);
 }
 
 runTests().catch(err => {

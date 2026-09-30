@@ -13,6 +13,20 @@ const SUPPRESSION_FILE = path.resolve("./suppression_list.json");
 let _suppressionCache = null;
 let _suppressedEmails = new Set();
 let _suppressedDomains = new Set();
+let _suppressedCompanies = new Set();
+
+const SUPPRESSION_REASONS = [
+  "OPT_OUT",
+  "BOUNCE",
+  "COMPLAINT",
+  "DO_NOT_CONTACT",
+  "MANUAL_BLOCK",
+];
+
+function normalizeCompanyName(name) {
+  if (!name || typeof name !== "string") return "";
+  return name.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
 
 /**
  * Load or initialize the suppression list.
@@ -31,20 +45,26 @@ function loadSuppressionList() {
       "noreply.com",
       "no-reply.com",
     ],
+    companies: [],
     updatedAt: new Date().toISOString(),
   });
+
+  if (!Array.isArray(data.companies)) {
+    data.companies = [];
+  }
 
   _suppressionCache = data;
   _suppressedEmails = new Set(data.emails.map(e => (typeof e === "string" ? e : e.email).toLowerCase().trim()));
   _suppressedDomains = new Set(data.domains.map(d => d.toLowerCase().trim()));
+  _suppressedCompanies = new Set(data.companies.map(c => normalizeCompanyName(typeof c === "string" ? c : c.company)).filter(Boolean));
   return _suppressionCache;
 }
 
 /**
- * Check if an email address or its domain is on the suppression list.
+ * Check if an email address, its domain, or its company is on the suppression list.
  * Returns { suppressed: boolean, reason?: string, type?: string }
  */
-function isSuppressed(email) {
+function isSuppressed(email, company = "") {
   if (!email || typeof email !== "string") {
     return { suppressed: true, reason: "Invalid email string", type: "invalid" };
   }
@@ -52,17 +72,17 @@ function isSuppressed(email) {
   loadSuppressionList();
   const clean = email.trim().toLowerCase();
 
-  // Check exact email
+  // 1. Check exact email
   if (_suppressedEmails.has(clean)) {
     const record = _suppressionCache.emails.find(
       e => (typeof e === "string" ? e : e.email).toLowerCase().trim() === clean
     );
     const reason = typeof record === "object" ? record.reason : "Suppressed on user request / Opt-out";
-    const type = typeof record === "object" ? record.type : "opt_out";
+    const type = typeof record === "object" ? (record.type || "opt_out") : "opt_out";
     return { suppressed: true, reason, type };
   }
 
-  // Check domain
+  // 2. Check domain
   const atIdx = clean.indexOf("@");
   if (atIdx !== -1) {
     const domain = clean.slice(atIdx + 1);
@@ -71,13 +91,26 @@ function isSuppressed(email) {
     }
   }
 
+  // 3. Check company
+  if (company && typeof company === "string") {
+    const normComp = normalizeCompanyName(company);
+    if (normComp && _suppressedCompanies.has(normComp)) {
+      const record = _suppressionCache.companies.find(
+        c => normalizeCompanyName(typeof c === "string" ? c : c.company) === normComp
+      );
+      const reason = typeof record === "object" ? record.reason : `Company ${company} is suppressed`;
+      const type = typeof record === "object" ? (record.type || "DO_NOT_CONTACT") : "DO_NOT_CONTACT";
+      return { suppressed: true, reason, type };
+    }
+  }
+
   return { suppressed: false };
 }
 
 /**
- * Add an email or domain to the suppression list.
+ * Add an email, domain, or company to the suppression list.
  */
-async function addSuppression({ email, domain, reason = "Opted out / Unsubscribed", type = "opt_out" }) {
+async function addSuppression({ email, domain, company, reason = "Opted out / Unsubscribed", type = "opt_out" }) {
   return await withFileLock(SUPPRESSION_FILE, async () => {
     loadSuppressionList();
     let modified = false;
@@ -106,19 +139,40 @@ async function addSuppression({ email, domain, reason = "Opted out / Unsubscribe
       }
     }
 
+    if (company) {
+      const normComp = normalizeCompanyName(company);
+      if (normComp && !_suppressedCompanies.has(normComp)) {
+        if (!_suppressionCache.companies) _suppressionCache.companies = [];
+        _suppressionCache.companies.push({
+          company: company.trim(),
+          normalized: normComp,
+          reason,
+          type,
+          addedAt: new Date().toISOString(),
+        });
+        _suppressedCompanies.add(normComp);
+        modified = true;
+      }
+    }
+
     if (modified) {
       _suppressionCache.updatedAt = new Date().toISOString();
       atomicWriteJsonSync(SUPPRESSION_FILE, _suppressionCache);
     }
 
-    return { ok: true, count: _suppressionCache.emails.length };
+    return {
+      ok: true,
+      totalEmails: _suppressionCache.emails.length,
+      totalDomains: _suppressionCache.domains.length,
+      totalCompanies: (_suppressionCache.companies || []).length,
+    };
   });
 }
 
 /**
- * Remove an email or domain from the suppression list.
+ * Remove an email, domain, or company from the suppression list.
  */
-async function removeSuppression({ email, domain }) {
+async function removeSuppression({ email, domain, company }) {
   return await withFileLock(SUPPRESSION_FILE, async () => {
     loadSuppressionList();
     let modified = false;
@@ -145,12 +199,28 @@ async function removeSuppression({ email, domain }) {
       }
     }
 
+    if (company) {
+      const normComp = normalizeCompanyName(company);
+      if (normComp && _suppressedCompanies.has(normComp)) {
+        _suppressionCache.companies = (_suppressionCache.companies || []).filter(
+          c => normalizeCompanyName(typeof c === "string" ? c : c.company) !== normComp
+        );
+        _suppressedCompanies.delete(normComp);
+        modified = true;
+      }
+    }
+
     if (modified) {
       _suppressionCache.updatedAt = new Date().toISOString();
       atomicWriteJsonSync(SUPPRESSION_FILE, _suppressionCache);
     }
 
-    return { ok: true, count: _suppressionCache.emails.length };
+    return {
+      ok: true,
+      totalEmails: _suppressionCache.emails.length,
+      totalDomains: _suppressionCache.domains.length,
+      totalCompanies: (_suppressionCache.companies || []).length,
+    };
   });
 }
 
@@ -162,16 +232,21 @@ function getSuppressionSummary() {
   return {
     totalEmails: _suppressionCache.emails.length,
     totalDomains: _suppressionCache.domains.length,
+    totalCompanies: (_suppressionCache.companies || []).length,
     emails: _suppressionCache.emails,
     domains: _suppressionCache.domains,
+    companies: _suppressionCache.companies || [],
+    reasons: SUPPRESSION_REASONS,
     updatedAt: _suppressionCache.updatedAt,
   };
 }
 
 module.exports = {
+  SUPPRESSION_REASONS,
   loadSuppressionList,
   isSuppressed,
   addSuppression,
   removeSuppression,
   getSuppressionSummary,
 };
+

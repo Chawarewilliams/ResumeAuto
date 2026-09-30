@@ -35,6 +35,19 @@ const { TEMPLATE_CATEGORIES, loadTemplates, saveTemplates, renderTemplate } = re
 const { ingestJobsFromSource } = require("./engine/sources");
 const { logActivity, queryActivityLogs } = require("./engine/activityLogger");
 const { INTERVIEW_STAGES, loadInterviews, addInterview, updateInterview, deleteInterview } = require("./engine/interviewModel");
+const {
+  evaluateEmailSafety,
+  evaluateBatchSafety,
+  acquireSendLock,
+  releaseSendLock,
+  hasActiveSendLock,
+  getActiveSendLocksCount,
+  loadBlockedDomains,
+  saveBlockedDomains,
+  isPersonalEmailDomain,
+  isDisposableEmailDomain,
+  normalizeEmail,
+} = require("./engine/safetyEngine");
 
 // ─── IMAP RESILIENCE PATCH (prevents unhandled fetchCache crash) ──
 try {
@@ -1362,7 +1375,237 @@ function getAnalytics() {
 }
 
 // Invalidate analytics cache when a new email is sent
-function invalidateAnalyticsCache() { _analyticsCacheTime = 0; }
+function invalidateAnalyticsCache() {
+  _analyticsCacheTime = 0;
+  _analyticsBundleCacheTime = 0;
+}
+
+// ─── HIGH-PERFORMANCE CONSOLIDATED ANALYTICS BUNDLE ───────────
+let _analyticsBundleCache = null;
+let _analyticsBundleCacheTime = 0;
+const ANALYTICS_BUNDLE_CACHE_TTL = 3000;
+
+function getAnalyticsBundle() {
+  const now = Date.now();
+  if (_analyticsBundleCache && (now - _analyticsBundleCacheTime < ANALYTICS_BUNDLE_CACHE_TTL)) {
+    const delay = SPEED_DELAY[state.speed] || 1500;
+    const remaining = Math.max(0, state.total - state.sent);
+    const etaSeconds = remaining > 0 && state.running ? Math.floor((remaining * delay) / 1000) : 0;
+    const totalSession = state.sent + state.failed;
+    const successRate = totalSession > 0 ? Math.round(state.sent / totalSession * 100) : 0;
+    return {
+      ..._analyticsBundleCache,
+      analytics: {
+        ..._analyticsBundleCache.analytics,
+        etaSeconds,
+        remaining,
+        successRate,
+      },
+    };
+  }
+
+  const analytics = getAnalytics();
+  const { entries } = loadSentLogData();
+  const nowDate = new Date();
+
+  // Weekly data (last 14 days split into thisWeek and lastWeek)
+  const weekData = {};
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(nowDate);
+    d.setDate(d.getDate() - i);
+    weekData[d.toISOString().split("T")[0]] = 0;
+  }
+  for (let i = 0; i < entries.length; i++) {
+    const date = entries[i].date;
+    if (date && Object.prototype.hasOwnProperty.call(weekData, date)) weekData[date]++;
+  }
+  const dates = Object.keys(weekData).sort();
+  const thisWeek = dates.slice(7);
+  const lastWeek = dates.slice(0, 7);
+  const weekly = {
+    labels: thisWeek.map(d => d.slice(5)),
+    thisWeek: thisWeek.map(d => weekData[d]),
+    lastWeek: lastWeek.map(d => weekData[d]),
+  };
+
+  // Status breakdown from JOBS
+  const status = { sent: 0, viewed: 0, interview: 0, rejected: 0, offer: 0 };
+  if (Array.isArray(JOBS)) {
+    JOBS.forEach(j => {
+      if (j && Object.prototype.hasOwnProperty.call(status, j.status)) status[j.status]++;
+    });
+  }
+
+  // Top Domains
+  const domainsMap = {};
+  for (let i = 0; i < entries.length; i++) {
+    const email = entries[i].email;
+    if (email) {
+      const at = email.indexOf("@");
+      if (at !== -1) {
+        const dom = email.slice(at + 1);
+        domainsMap[dom] = (domainsMap[dom] || 0) + 1;
+      }
+    }
+  }
+  const sortedDomains = Object.entries(domainsMap).sort((a, b) => b[1] - a[1]).slice(0, 8);
+  const domains = { domains: sortedDomains.map(([domain, count]) => ({ domain, count })) };
+
+  // Streak
+  const datesSet = new Set(entries.map(e => e.date).filter(d => d && d !== "earlier"));
+  let streak = 0;
+  for (let i = 0; i < 365; i++) {
+    const d = new Date(nowDate);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toISOString().split("T")[0];
+    if (datesSet.has(dateStr)) streak++;
+    else if (i > 0) break;
+  }
+  const streakData = { currentStreak: streak, bestStreak: streak, totalActiveDays: datesSet.size };
+
+  // Goals
+  let goalsConfig = { weekly: 200, monthly: 800 };
+  try {
+    if (fs.existsSync("./goals.json")) goalsConfig = JSON.parse(fs.readFileSync("./goals.json", "utf8"));
+  } catch(e) {}
+  const weekAgo = new Date(nowDate); weekAgo.setDate(weekAgo.getDate() - 7);
+  const monthAgo = new Date(nowDate); monthAgo.setDate(monthAgo.getDate() - 30);
+  const weekStr = weekAgo.toISOString().split("T")[0];
+  const monthStr = monthAgo.toISOString().split("T")[0];
+  const sentThisWeek = entries.filter(e => e.date && e.date >= weekStr).length;
+  const sentThisMonth = entries.filter(e => e.date && e.date >= monthStr).length;
+  const goals = {
+    ...goalsConfig,
+    sentThisWeek,
+    sentThisMonth,
+    weeklyPct: goalsConfig.weekly > 0 ? Math.min(100, Math.round(sentThisWeek / goalsConfig.weekly * 100)) : 0,
+    monthlyPct: goalsConfig.monthly > 0 ? Math.min(100, Math.round(sentThisMonth / goalsConfig.monthly * 100)) : 0,
+  };
+
+  // Hourly counts
+  const hourly = Array(24).fill(0);
+  for (let i = 0; i < entries.length; i++) {
+    const h = entries[i].hour;
+    if (h !== null && !isNaN(h) && h >= 0 && h < 24) hourly[h]++;
+  }
+
+  // A/B Test
+  const a = _abTracker ? _abTracker.A : { sent: 0, opened: 0, replied: 0 };
+  const b = _abTracker ? _abTracker.B : { sent: 0, opened: 0, replied: 0 };
+  const winner = (a.sent === 0 && b.sent === 0) ? "none" :
+    (a.opened / Math.max(a.sent, 1)) >= (b.opened / Math.max(b.sent, 1)) ? "A" : "B";
+  const abTest = {
+    A: { ...a, openRate: a.sent > 0 ? Math.round((a.opened / a.sent) * 100) : 0 },
+    B: { ...b, openRate: b.sent > 0 ? Math.round((b.opened / b.sent) * 100) : 0 },
+    winner,
+    totalSent: a.sent + b.sent,
+  };
+
+  // Send-Time Intelligence
+  const hourCounts = new Array(24).fill(0), hourReplies = new Array(24).fill(0);
+  if (Array.isArray(JOBS)) {
+    for (const j of JOBS) {
+      if (j && j.dateSent) {
+        const h = new Date(j.dateSent).getHours();
+        if (!isNaN(h)) {
+          hourCounts[h]++;
+          if (j.status === "replied" || j.status === "interview" || j.status === "offer") hourReplies[h]++;
+        }
+      }
+    }
+  }
+  const hourData = hourCounts.map((count, hour) => ({
+    hour,
+    sent: count,
+    replied: hourReplies[hour],
+    replyRate: count > 0 ? Math.round((hourReplies[hour] / count) * 100) : 0,
+  }));
+  const bestHours = [...hourData].filter(h => h.sent >= 3).sort((x, y) => y.replyRate - x.replyRate).slice(0, 5);
+  const optimalHours = {
+    hourData,
+    bestHours,
+    recommendation: bestHours.length > 0 ? "Best: " + bestHours[0].hour + ":00 (" + bestHours[0].replyRate + "% reply rate)" : "Not enough data yet",
+  };
+
+  // Cumulative outreach growth
+  const dailyMap = {};
+  for (const e of entries) {
+    const day = e.date || "unknown";
+    dailyMap[day] = (dailyMap[day] || 0) + 1;
+  }
+  let cumulative = 0;
+  const cumulativeData = Object.keys(dailyMap).sort().map(day => {
+    cumulative += dailyMap[day];
+    return { date: day, daily: dailyMap[day], cumulative };
+  });
+  const cumulativeGrowth = { data: cumulativeData, totalEver: cumulative };
+
+  // Smart Blacklist
+  const blDomains = [];
+  if (_domainFailures) {
+    for (const [dom, d] of _domainFailures) {
+      blDomains.push({
+        domain: dom,
+        fails: d.fails,
+        total: d.total,
+        failRate: d.total > 0 ? Math.round((d.fails / d.total) * 100) : 0,
+        blacklisted: _blacklistedDomains ? _blacklistedDomains.has(dom) : false,
+      });
+    }
+  }
+  blDomains.sort((x, y) => y.failRate - x.failRate);
+  const blacklist = {
+    blacklistedCount: _blacklistedDomains ? _blacklistedDomains.size : 0,
+    blacklisted: _blacklistedDomains ? [..._blacklistedDomains] : [],
+    domains: blDomains.slice(0, 50),
+  };
+
+  // Company engagement
+  const companyMap = {};
+  if (Array.isArray(JOBS)) {
+    for (const j of JOBS) {
+      if (!j) continue;
+      const c = j.company || "Unknown";
+      if (!companyMap[c]) companyMap[c] = { company: c, sent: 0, opened: 0, replied: 0, interview: 0, offer: 0, rejected: 0 };
+      companyMap[c].sent++;
+      if (j.opened) companyMap[c].opened++;
+      if (j.status === "replied") companyMap[c].replied++;
+      if (j.status === "interview") companyMap[c].interview++;
+      if (j.status === "offer") companyMap[c].offer++;
+      if (j.status === "rejected") companyMap[c].rejected++;
+    }
+  }
+  const companiesList = Object.values(companyMap).map(c => {
+    c.score = (c.offer * 100) + (c.interview * 50) + (c.replied * 20) + (c.opened * 5);
+    return c;
+  }).sort((x, y) => y.score - x.score);
+  const companies = { companies: companiesList.slice(0, 100), totalCompanies: companiesList.length };
+
+  // 24-Hour Recruiter Open Activity Heatmap
+  const hourlyHeatmap = typeof getHourlyHeatmapData === "function" ? getHourlyHeatmapData() : { ok: true, hourly: [] };
+
+  const bundle = {
+    ok: true,
+    timestamp: now,
+    analytics,
+    weekly,
+    status,
+    domains,
+    streak: streakData,
+    goals,
+    hourly: { hourly },
+    abTest,
+    optimalHours,
+    cumulative: cumulativeGrowth,
+    blacklist,
+    companies,
+    hourlyHeatmap,
+  };
+
+  _analyticsBundleCache = bundle;
+  _analyticsBundleCacheTime = now;
+  return bundle;
+}
 
 // ─── LOAD EMAIL FILES ─────────────────────────────────────────
 let allEmails = [];
@@ -1411,29 +1654,22 @@ function loadAllEmailFiles() {
       }
 
       for (let rawEmail of foundEmails) {
-        let email = sanitizeEmailCandidate(rawEmail);
-        if (!isValidRfcEmail(email)) {
+        const safety = evaluateEmailSafety(rawEmail, {
+          company,
+          allowPersonal: CONFIG.skipPersonalGmail === false,
+          skipCooldown: CONFIG.resendSentEmails,
+          isCooldownFunc: isInCooldown,
+          ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
+        });
+
+        if (!safety.eligible) {
           skipped++;
           continue;
         }
 
-        // Skip personal @gmail.com addresses (corporate / company domains only)
-        if (CONFIG.skipPersonalGmail !== false && (email.toLowerCase().endsWith("@gmail.com") || email.toLowerCase().includes("@gmail."))) {
-          skipped++;
-          continue;
-        }
-
-        // Prevent emailing sender's own sending account(s)
-        const isOwnSender = CONFIG.accounts.some(a => a.gmailAddress && a.gmailAddress.toLowerCase() === email.toLowerCase()) ||
-          email === "milinchaware@gmail.com" || email === "milinchaware9@gmail.com";
-        if (isOwnSender) { skipped++; continue; }
+        const email = safety.normalizedEmail;
         if (seen.has(email)) { skipped++; continue; }
         seen.add(email);
-        // 6-month cooldown: skip only if sent within the last 6 months
-        if (!CONFIG.resendSentEmails && cooldownLog.has(email)) {
-          skipped++;
-          continue;
-        }
         emails.push({ email, company, context, source: file });
       }
     }
@@ -1534,11 +1770,15 @@ function getMailAttachment() {
 
 // ─── SEND ONE EMAIL (with retry & AI personalization & tracking) ──────────
 async function sendOne(transporter, to, company, context = "", jobId = null, attempt = 0) {
-  if (!isValidRfcEmail(to)) {
-    return { success: false, error: `Invalid recipient RFC 5321 email syntax: ${to}`, permanent: true };
-  }
-  if (CONFIG.skipPersonalGmail !== false && (to.toLowerCase().endsWith("@gmail.com") || to.toLowerCase().includes("@gmail."))) {
-    return { success: false, error: "Skipped: Personal @gmail.com addresses are disabled", permanent: true };
+  const safety = evaluateEmailSafety(to, {
+    company,
+    allowPersonal: CONFIG.skipPersonalGmail === false,
+    skipCooldown: true, // cooldown already validated before dispatch
+    acquireLock: false,
+    ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
+  });
+  if (!safety.eligible) {
+    return { success: false, error: safety.reason, status: safety.status, permanent: true };
   }
 
   // v7.0: A/B Testing Slot Selection
@@ -1815,43 +2055,26 @@ async function sendEmails() {
       state.remainingEmails = Math.max(0, allEmails.length - myIndex);
       const num = `[${myIndex + 1}/${allEmails.length}]`;
 
-      // Real-time duplicate guard: re-check sent log before sending
-      // 6-month cooldown: re-check with cooldown window, not permanent block
-      const currentCooldownLog = loadSentLogCooldown();
-      if (!CONFIG.resendSentEmails && currentCooldownLog.has(email.toLowerCase())) {
-        addLog(`⏭️  ${num} ${email} — Already sent, skipping duplicate`, "warn");
-        state.skipped++;
-        saveProgress(myIndex + 1, accIdx, state.accountSentCount);
-        continue;
-      }
+      // ─── EMAIL SAFETY ENGINE PIPELINE (with Atomic Send Lock) ─────────
+      const safety = evaluateEmailSafety(email, {
+        company,
+        workerId,
+        acquireLock: true, // Atomically acquires lock to prevent worker race conditions
+        allowPersonal: CONFIG.skipPersonalGmail === false,
+        skipCooldown: CONFIG.resendSentEmails,
+        isCooldownFunc: isInCooldown,
+        ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
+      });
 
-      // Suppression & Opt-Out Shield
-      const suppressionStatus = isSuppressed(email);
-      if (suppressionStatus.suppressed) {
+      if (!safety.eligible) {
         state.skipped++;
-        addLog(`🚫  ${num} ${email} — Skipped: Recipient suppressed (${suppressionStatus.reason})`, "warn");
+        addLog(`🛡️ [Safety Engine] ${num} ${email} — Skipped: ${safety.reason}`, "warn");
         logActivity({
-          eventType: "EMAIL_SUPPRESSED",
+          eventType: safety.status,
           entity: "Email",
           status: "WARN",
-          message: `Suppressed outreach to ${email}: ${suppressionStatus.reason}`,
-          metadata: { email, reason: suppressionStatus.reason }
-        });
-        saveProgress(myIndex + 1, accIdx, state.accountSentCount);
-        continue;
-      }
-
-      // Recruiter Frequency & Anti-Harassment Cooldown Check
-      const recruiterSafety = checkOutreachSafety(email, company);
-      if (!recruiterSafety.safe) {
-        state.skipped++;
-        addLog(`⏸️  ${num} ${email} — Skipped: ${recruiterSafety.reason}`, "warn");
-        logActivity({
-          eventType: "RECRUITER_COOLDOWN",
-          entity: "Recruiter",
-          status: "WARN",
-          message: `Skipped ${email}: ${recruiterSafety.reason}`,
-          metadata: { email, reason: recruiterSafety.reason }
+          message: `Safety check skipped ${email}: ${safety.reason}`,
+          metadata: { email, status: safety.status, reason: safety.reason }
         });
         saveProgress(myIndex + 1, accIdx, state.accountSentCount);
         continue;
@@ -1860,6 +2083,7 @@ async function sendEmails() {
       // Check warm-up mode daily limit
       const warmupLimit = getWarmupLimit();
       if (warmupLimit !== null && state.sent >= warmupLimit) {
+        releaseSendLock(safety.normalizedEmail);
         if (!stopping) {
           stopping = true;
           addLog(`🌱 Warm-up Mode: Daily limit of ${warmupLimit} reached for today. Run again tomorrow.`, "warn");
@@ -1874,6 +2098,7 @@ async function sendEmails() {
 
       // v7.0: Smart Blacklist Check
       if (isDomainBlacklisted(email)) {
+        releaseSendLock(safety.normalizedEmail);
         state.skipped++;
         addLog(`🚫  ${num} ${email} — Skipped (domain blacklisted)`, "warn");
         saveProgress(myIndex + 1, accIdx, state.accountSentCount);
@@ -1894,6 +2119,7 @@ async function sendEmails() {
             }
           }
           if (!_inFlightMxCache.get(dom)) {
+            releaseSendLock(safety.normalizedEmail);
             _inFlightBlockedCount++;
             state.skipped++;
             addLog(`🛡️ [Auto-Shield] ${num} ${email} — Skipped unreachable domain (no DNS MX records found)`, "warn");
@@ -1903,7 +2129,12 @@ async function sendEmails() {
         }
       }
 
-      const result = await sendOne(activeTransporter, email, company, context, jobId);
+      let result;
+      try {
+        result = await sendOne(activeTransporter, email, company, context, jobId);
+      } finally {
+        releaseSendLock(safety.normalizedEmail);
+      }
 
       if (result.success) {
         state.sent++;
@@ -2385,38 +2616,31 @@ function startDashboard() {
   app.post("/api/send-direct", async (req, res) => {
     const { toEmail, company = "Target Company", role = "Python Developer Position", customSubject, customBody } = req.body;
     if (!toEmail || !toEmail.includes("@")) return res.status(400).json({ error: "Valid recipient email required" });
-    const normalizedEmail = sanitizeEmailCandidate(toEmail);
 
-    // Suppression check
-    const suppressionStatus = isSuppressed(normalizedEmail);
-    if (suppressionStatus.suppressed) {
+    // ─── EMAIL SAFETY ENGINE EVALUATION ──────────────────────────
+    const safety = evaluateEmailSafety(toEmail, {
+      company,
+      workerId: "direct-send",
+      acquireLock: true,
+      allowPersonal: CONFIG.skipPersonalGmail === false,
+      isCooldownFunc: isInCooldown,
+      ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
+    });
+
+    if (!safety.eligible) {
       state.skipped++;
-      addLog(`🚫  Direct email skipped for ${normalizedEmail} — Recipient suppressed (${suppressionStatus.reason})`, "warn");
-      return res.json({ ok: false, suppressed: true, message: `Email to ${normalizedEmail} blocked: ${suppressionStatus.reason}` });
+      addLog(`🛡️ [Direct Send Blocked] ${toEmail} — ${safety.reason}`, "warn");
+      return res.json({
+        ok: false,
+        skipped: true,
+        suppressed: safety.status === "SUPPRESSED",
+        cooldown: safety.status === "SKIPPED_COOLDOWN",
+        status: safety.status,
+        message: safety.reason,
+      });
     }
 
-    // Recruiter frequency & cooldown check
-    const safety = checkOutreachSafety(normalizedEmail, company);
-    if (!safety.safe) {
-      state.skipped++;
-      addLog(`⏸️  Direct email skipped for ${normalizedEmail} — ${safety.reason}`, "warn");
-      return res.json({ ok: false, safetyWarning: true, message: safety.reason });
-    }
-
-    // 6-month cooldown check for direct sends
-    const cooldownStatus = isInCooldown(normalizedEmail);
-    if (cooldownStatus.inCooldown) {
-      state.skipped++;
-      addLog(`🔒  Direct email skipped for ${normalizedEmail} — in 6-month cooldown (sent: ${cooldownStatus.lastSentDate}, unlocks: ${cooldownStatus.unlockDate})`, "warn");
-      return res.json({ ok: true, skipped: true, cooldown: true, message: `Email to ${normalizedEmail} is in 6-month cooldown (sent: ${cooldownStatus.lastSentDate}, unlocks: ${cooldownStatus.unlockDate})` });
-    }
-    if (_directSendsInProgress.has(normalizedEmail)) {
-      state.skipped++;
-      addLog(`⏭️  Direct email skipped for ${normalizedEmail} — send already in progress`, "warn");
-      return res.json({ ok: true, skipped: true, message: `Email to ${normalizedEmail} is already being sent; skipped` });
-    }
-    _directSendsInProgress.add(normalizedEmail);
-
+    const normalizedEmail = safety.normalizedEmail;
     const acc = CONFIG.accounts[state.accountIndex % CONFIG.accounts.length];
     try {
       const transporter = createTransporter(acc);
@@ -2452,10 +2676,8 @@ function startDashboard() {
         addJob({ company, email: normalizedEmail, role, dateSent: new Date().toISOString().split("T")[0], status: "sent" });
       }
 
-      _directSendsInProgress.delete(normalizedEmail);
       res.json({ ok: true, message: `Direct email sent to ${normalizedEmail}` });
     } catch (err) {
-      _directSendsInProgress.delete(normalizedEmail);
       logActivity({
         eventType: "DIRECT_EMAIL_FAILED",
         entity: "Email",
@@ -2465,6 +2687,8 @@ function startDashboard() {
       });
       addLog(`❌  Direct email to ${normalizedEmail} failed: ${err.message}`, "error");
       res.json({ ok: false, error: err.message });
+    } finally {
+      releaseSendLock(normalizedEmail);
     }
   });
 
@@ -4376,6 +4600,15 @@ async function checkAndSyncInbox(options = {}) {
     res.json({ domains: Object.values(summary) });
   });
 
+  // ─── HIGH-SPEED UNIFIED ANALYTICS BUNDLE ───────────────────
+  app.get("/api/analytics/bundle", (req, res) => {
+    try {
+      res.json(getAnalyticsBundle());
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
   // ─── RESUMEAUTO V9 INTELLIGENT PLATFORM ENDPOINTS ─────────────
 
   // 1. Candidate Profile Endpoints (Section 5)
@@ -4544,61 +4777,17 @@ async function checkAndSyncInbox(options = {}) {
       }
 
       const lines = rawEmails.split("\n");
-      const cooldownLog = loadSentLogCooldown();
-      const suppressed = [];
-      const cooldownBlocked = [];
-      const ready = [];
-      const invalid = [];
-      const seen = new Set();
+      const report = evaluateBatchSafety(lines, {
+        allowPersonal: CONFIG.skipPersonalGmail === false,
+        isCooldownFunc: isInCooldown,
+        ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
+      });
 
-      for (const rawLine of lines) {
-        const trimmed = rawLine.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-
-        let company = "Your Company";
-        let textToSearch = trimmed;
-        if (trimmed.includes(",")) {
-          const parts = trimmed.split(",");
-          textToSearch = parts[0].trim();
-          company = parts[1]?.trim() || "Your Company";
-        }
-
-        const foundEmails = textToSearch.toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi);
-        if (!foundEmails || foundEmails.length === 0) {
-          invalid.push({ line: trimmed, reason: "No valid email found" });
-          continue;
-        }
-
-        for (let rawEmail of foundEmails) {
-          let email = sanitizeEmailCandidate(rawEmail);
-          if (!isValidRfcEmail(email)) {
-            invalid.push({ line: trimmed, reason: "Invalid email syntax" });
-            continue;
-          }
-          if (seen.has(email)) continue;
-          seen.add(email);
-
-          // Check suppression
-          const suppStatus = isSuppressed(email);
-          if (suppStatus.suppressed) {
-            suppressed.push({ email, reason: suppStatus.reason });
-            continue;
-          }
-
-          // Check 6-month cooldown
-          if (cooldownLog.has(email)) {
-            const cdInfo = isInCooldown(email);
-            cooldownBlocked.push({
-              email,
-              lastSent: cdInfo.lastSentDate,
-              unlockDate: cdInfo.unlockDate,
-            });
-            continue;
-          }
-
-          ready.push({ email, company });
-        }
-      }
+      const ready = report.ready;
+      const cooldownBlocked = report.rejected.filter(r => r.status === "SKIPPED_COOLDOWN");
+      const suppressed = report.rejected.filter(r => r.status === "SUPPRESSED");
+      const personalBlocked = report.rejected.filter(r => r.status === "BLOCKED_PERSONAL_DOMAIN");
+      const invalid = report.rejected.filter(r => r.status === "INVALID_SYNTAX");
 
       // Save ready emails as a new batch file
       let savedFile = null;
@@ -4610,7 +4799,7 @@ async function checkAndSyncInbox(options = {}) {
         savedFile = `campaign_paste${nextNum}.txt`;
         const content = ready.map(r => r.company !== "Your Company" ? `${r.email}, ${r.company}` : r.email).join("\n");
         fs.writeFileSync(path.join(EMAILS_DIR, savedFile), content);
-        addLog(`📋  Quick Campaign: ${ready.length} emails saved to ${savedFile} (${cooldownBlocked.length} in cooldown, ${invalid.length} invalid)`, "success");
+        addLog(`📋  Quick Campaign: ${ready.length} emails saved to ${savedFile} (${cooldownBlocked.length} in cooldown, ${personalBlocked.length} personal blocked, ${invalid.length} invalid)`, "success");
 
         // Reload queue
         allEmails = loadAllEmailFiles();
@@ -4629,8 +4818,8 @@ async function checkAndSyncInbox(options = {}) {
         eventType: "QUICK_CAMPAIGN_PASTE",
         entity: "Campaign",
         status: ready.length > 0 ? "SUCCESS" : "WARN",
-        message: `Quick paste: ${ready.length} ready, ${cooldownBlocked.length} in cooldown, ${invalid.length} invalid`,
-        metadata: { ready: ready.length, cooldown: cooldownBlocked.length, invalid: invalid.length, suppressed: suppressed.length, file: savedFile }
+        message: `Quick paste: ${ready.length} ready, ${cooldownBlocked.length} in cooldown, ${personalBlocked.length} personal blocked, ${invalid.length} invalid`,
+        metadata: { ready: ready.length, cooldown: cooldownBlocked.length, personalBlocked: personalBlocked.length, invalid: invalid.length, suppressed: suppressed.length, file: savedFile }
       });
 
       res.json({
@@ -4638,14 +4827,17 @@ async function checkAndSyncInbox(options = {}) {
         savedFile,
         autoStarted: autoStart && ready.length > 0,
         summary: {
-          total: seen.size,
+          total: report.uniqueCount,
           ready: ready.length,
           cooldownBlocked: cooldownBlocked.length,
+          personalBlocked: personalBlocked.length,
           suppressed: suppressed.length,
           invalid: invalid.length,
+          rawReport: report.summary,
         },
         ready: ready.slice(0, 50),
         cooldownBlocked: cooldownBlocked.slice(0, 50),
+        personalBlocked: personalBlocked.slice(0, 50),
         suppressed: suppressed.slice(0, 20),
         invalid: invalid.slice(0, 20),
       });
@@ -4720,6 +4912,107 @@ async function checkAndSyncInbox(options = {}) {
       res.status(500).json({ error: e.message });
     }
   });
+
+  // ─── EMAIL SAFETY ENGINE APIS (Section 4 & 5) ──────────────────
+  app.post("/api/safety/check", (req, res) => {
+    try {
+      const { email, emails, company = "" } = req.body || {};
+      if (email && typeof email === "string") {
+        const verdict = evaluateEmailSafety(email, {
+          company,
+          allowPersonal: CONFIG.skipPersonalGmail === false,
+          isCooldownFunc: isInCooldown,
+          ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
+        });
+        return res.json({ ok: true, verdict });
+      }
+
+      const list = Array.isArray(emails) ? emails : (typeof emails === "string" ? emails.split("\n") : []);
+      if (!list.length) {
+        return res.status(400).json({ error: "Provide 'email' string or 'emails' array to check" });
+      }
+
+      const batchReport = evaluateBatchSafety(list, {
+        company,
+        allowPersonal: CONFIG.skipPersonalGmail === false,
+        isCooldownFunc: isInCooldown,
+        ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
+      });
+      res.json({ ok: true, report: batchReport });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.get("/api/safety/blocked-domains", (req, res) => {
+    try {
+      const config = loadBlockedDomains();
+      res.json({ ok: true, blockedDomains: config });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post("/api/safety/blocked-domains", async (req, res) => {
+    try {
+      const { domain, type = "custom" } = req.body || {};
+      if (!domain || typeof domain !== "string") {
+        return res.status(400).json({ error: "Domain string required" });
+      }
+      const cleanDom = domain.trim().toLowerCase().replace(/^@/, "");
+      const config = loadBlockedDomains();
+      if (type === "personal") {
+        if (!config.personal.includes(cleanDom)) config.personal.push(cleanDom);
+      } else {
+        if (!config.customBlocked.includes(cleanDom)) config.customBlocked.push(cleanDom);
+      }
+      const updated = await saveBlockedDomains(config);
+      addLog(`🚫 [Safety Engine] Added @${cleanDom} to blocked ${type} domains`, "info");
+      res.json({ ok: true, blockedDomains: updated });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.delete("/api/safety/blocked-domains", async (req, res) => {
+    try {
+      const { domain, type = "custom" } = req.body || {};
+      if (!domain || typeof domain !== "string") {
+        return res.status(400).json({ error: "Domain string required" });
+      }
+      const cleanDom = domain.trim().toLowerCase().replace(/^@/, "");
+      const config = loadBlockedDomains();
+      if (type === "personal") {
+        config.personal = config.personal.filter(d => d !== cleanDom);
+      } else {
+        config.customBlocked = config.customBlocked.filter(d => d !== cleanDom);
+      }
+      const updated = await saveBlockedDomains(config);
+      addLog(`✅ [Safety Engine] Removed @${cleanDom} from blocked ${type} domains`, "info");
+      res.json({ ok: true, blockedDomains: updated });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.get("/api/safety/stats", (req, res) => {
+    try {
+      const config = loadBlockedDomains();
+      res.json({
+        ok: true,
+        stats: {
+          activeSendLocks: getActiveSendLocksCount(),
+          personalDomainsBlockedCount: (config.personal || []).length,
+          disposableDomainsBlockedCount: (config.disposable || []).length,
+          customDomainsBlockedCount: (config.customBlocked || []).length,
+          personalBlockingEnabled: CONFIG.skipPersonalGmail !== false,
+        }
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
 
   // 8. Structured Activity Log Audit (Section 20)
   app.get("/api/activity-log", (req, res) => {
@@ -5070,46 +5363,153 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-/* ═══════════════ v7.0 TITAN DESIGN SYSTEM ═══════════════ */
+/* ═══════════════ v8.0 3D TITAN DESIGN SYSTEM ═══════════════ */
 :root,[data-theme="cyber"]{
-  --bg:#06080f;--surface:rgba(12,17,29,0.85);--card:rgba(16,22,40,0.65);--card-solid:#101628;
-  --border:rgba(99,102,241,0.15);--border-hover:rgba(99,102,241,0.35);
+  --bg:#030712;--bg-space:#030712;--surface:rgba(8,12,24,0.85);--card:rgba(13,19,36,0.65);--card-solid:#0d1324;
+  --border:rgba(99,102,241,0.16);--border-hover:rgba(99,102,241,0.38);--border-glass:rgba(255,255,255,0.08);
   --accent:#818cf8;--accent2:#a78bfa;--accent3:#c084fc;
   --accent-glow:rgba(129,140,248,0.25);--accent-glow2:rgba(167,139,250,0.2);
+  --cyan:#22d3ee;--cyan-glow:rgba(34,211,238,0.25);
   --green:#34d399;--green-glow:rgba(52,211,153,0.2);
   --yellow:#fbbf24;--yellow-glow:rgba(251,191,36,0.2);
   --red:#f87171;--red-glow:rgba(248,113,113,0.2);
   --blue:#60a5fa;--blue-glow:rgba(96,165,250,0.2);
-  --orange:#fb923c;--purple:#c084fc;--cyan:#22d3ee;--pink:#f472b6;
-  --text:#f1f5f9;--text-secondary:#94a3b8;--text-dim:#64748b;
+  --orange:#fb923c;--purple:#c084fc;--pink:#f472b6;
+  --text:#f8fafc;--text-secondary:#94a3b8;--text-dim:#64748b;
   --mono:'JetBrains Mono',monospace;--sans:'Inter',system-ui,-apple-system,sans-serif;
   --radius:16px;--radius-sm:10px;--radius-xs:6px;
-  --shadow:0 8px 32px rgba(0,0,0,0.4);--shadow-lg:0 16px 48px rgba(0,0,0,0.5);
-  --glass-bg:rgba(16,22,40,0.55);--glass-border:rgba(255,255,255,0.06);
+  --shadow:0 8px 32px rgba(0,0,0,0.45);--shadow-lg:0 16px 48px rgba(0,0,0,0.6);
+  --shadow-3d:0 16px 40px -8px rgba(0,0,0,0.6),0 0 20px -4px var(--accent-glow);
+  --shadow-3d-hover:0 24px 50px -10px rgba(0,0,0,0.75),0 0 30px -4px var(--accent-glow);
+  --glass-bg:rgba(13,19,36,0.6);--glass-border:rgba(255,255,255,0.07);
   --mesh-1:#818cf8;--mesh-2:#a78bfa;--mesh-3:#34d399;
+  --ease-spring:cubic-bezier(0.16,1,0.3,1);--ease-smooth:cubic-bezier(0.4,0,0.2,1);
+  --grad-ai:linear-gradient(135deg,#22d3ee 0%,#818cf8 50%,#c084fc 100%);
+  --grad-shield:linear-gradient(135deg,#34d399 0%,#22d3ee 100%);
+  --grad-orb:radial-gradient(circle at 35% 35%,#22d3ee 0%,#818cf8 45%,#030712 90%);
 }
-[data-theme="neon"]{--bg:#020617;--surface:rgba(8,12,25,0.9);--card:rgba(10,16,32,0.6);--card-solid:#0a1020;--border:rgba(6,182,212,0.18);--border-hover:rgba(6,182,212,0.4);--accent:#22d3ee;--accent2:#f472b6;--accent3:#a78bfa;--accent-glow:rgba(34,211,238,0.25);--accent-glow2:rgba(244,114,182,0.2);--mesh-1:#22d3ee;--mesh-2:#f472b6;--mesh-3:#a78bfa}
-[data-theme="aurora"]{--bg:#030712;--surface:rgba(10,15,30,0.9);--card:rgba(12,20,38,0.6);--card-solid:#0c1426;--border:rgba(52,211,153,0.18);--border-hover:rgba(52,211,153,0.4);--accent:#34d399;--accent2:#60a5fa;--accent3:#818cf8;--accent-glow:rgba(52,211,153,0.25);--accent-glow2:rgba(96,165,250,0.2);--green:#34d399;--mesh-1:#34d399;--mesh-2:#60a5fa;--mesh-3:#818cf8}
-[data-theme="sunset"]{--bg:#0c0510;--surface:rgba(18,10,24,0.9);--card:rgba(22,14,32,0.6);--card-solid:#160e20;--border:rgba(251,146,60,0.18);--border-hover:rgba(251,146,60,0.4);--accent:#fb923c;--accent2:#f472b6;--accent3:#c084fc;--accent-glow:rgba(251,146,60,0.25);--accent-glow2:rgba(244,114,182,0.2);--mesh-1:#fb923c;--mesh-2:#f472b6;--mesh-3:#c084fc}
-[data-theme="light"]{--bg:#f8fafc;--surface:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.85);--card-solid:#ffffff;--border:rgba(99,102,241,0.15);--border-hover:rgba(99,102,241,0.3);--accent:#6366f1;--accent2:#8b5cf6;--accent3:#a855f7;--accent-glow:rgba(99,102,241,0.15);--accent-glow2:rgba(139,92,246,0.12);--green:#10b981;--green-glow:rgba(16,185,129,0.15);--yellow:#f59e0b;--yellow-glow:rgba(245,158,11,0.15);--red:#ef4444;--red-glow:rgba(239,68,68,0.15);--blue:#3b82f6;--blue-glow:rgba(59,130,246,0.15);--orange:#f97316;--purple:#a855f7;--cyan:#06b6d4;--pink:#ec4899;--text:#0f172a;--text-secondary:#475569;--text-dim:#94a3b8;--glass-bg:rgba(255,255,255,0.7);--glass-border:rgba(0,0,0,0.06);--shadow:0 4px 16px rgba(0,0,0,0.06);--shadow-lg:0 8px 32px rgba(0,0,0,0.1);--mesh-1:#6366f1;--mesh-2:#8b5cf6;--mesh-3:#10b981}
+[data-theme="neon"]{--bg:#020617;--bg-space:#020617;--surface:rgba(8,12,25,0.9);--card:rgba(10,16,32,0.6);--card-solid:#0a1020;--border:rgba(6,182,212,0.18);--border-hover:rgba(6,182,212,0.4);--accent:#22d3ee;--accent2:#f472b6;--accent3:#a78bfa;--accent-glow:rgba(34,211,238,0.25);--accent-glow2:rgba(244,114,182,0.2);--mesh-1:#22d3ee;--mesh-2:#f472b6;--mesh-3:#a78bfa}
+[data-theme="aurora"]{--bg:#030712;--bg-space:#030712;--surface:rgba(10,15,30,0.9);--card:rgba(12,20,38,0.6);--card-solid:#0c1426;--border:rgba(52,211,153,0.18);--border-hover:rgba(52,211,153,0.4);--accent:#34d399;--accent2:#60a5fa;--accent3:#818cf8;--accent-glow:rgba(52,211,153,0.25);--accent-glow2:rgba(96,165,250,0.2);--green:#34d399;--mesh-1:#34d399;--mesh-2:#60a5fa;--mesh-3:#818cf8}
+[data-theme="sunset"]{--bg:#0c0510;--bg-space:#0c0510;--surface:rgba(18,10,24,0.9);--card:rgba(22,14,32,0.6);--card-solid:#160e20;--border:rgba(251,146,60,0.18);--border-hover:rgba(251,146,60,0.4);--accent:#fb923c;--accent2:#f472b6;--accent3:#c084fc;--accent-glow:rgba(251,146,60,0.25);--accent-glow2:rgba(244,114,182,0.2);--mesh-1:#fb923c;--mesh-2:#f472b6;--mesh-3:#c084fc}
+[data-theme="light"]{--bg:#f8fafc;--bg-space:#f8fafc;--surface:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.85);--card-solid:#ffffff;--border:rgba(99,102,241,0.15);--border-hover:rgba(99,102,241,0.3);--accent:#6366f1;--accent2:#8b5cf6;--accent3:#a855f7;--accent-glow:rgba(99,102,241,0.15);--accent-glow2:rgba(139,92,246,0.12);--green:#10b981;--green-glow:rgba(16,185,129,0.15);--yellow:#f59e0b;--yellow-glow:rgba(245,158,11,0.15);--red:#ef4444;--red-glow:rgba(239,68,68,0.15);--blue:#3b82f6;--blue-glow:rgba(59,130,246,0.15);--orange:#f97316;--purple:#a855f7;--cyan:#06b6d4;--pink:#ec4899;--text:#0f172a;--text-secondary:#475569;--text-dim:#94a3b8;--glass-bg:rgba(255,255,255,0.7);--glass-border:rgba(0,0,0,0.06);--shadow:0 4px 16px rgba(0,0,0,0.06);--shadow-lg:0 8px 32px rgba(0,0,0,0.1);--mesh-1:#6366f1;--mesh-2:#8b5cf6;--mesh-3:#10b981}
 [data-theme="light"] body::before{background:radial-gradient(ellipse 600px 400px at 10% 20%,rgba(99,102,241,0.04) 0%,transparent 70%),radial-gradient(ellipse 500px 500px at 85% 80%,rgba(139,92,246,0.03) 0%,transparent 70%),radial-gradient(ellipse 400px 300px at 50% 50%,rgba(16,185,129,0.02) 0%,transparent 70%)}
 [data-theme="light"] body::after{background-image:none}
 
+/* ═══ 3D DEPTH ENGINE CORE TOKENS & ACCESSIBILITY ═══ */
+.perspective-root{perspective:1000px}
+.card-3d{
+  transform-style:preserve-3d;
+  will-change:transform;
+  transition:transform 0.22s var(--ease-spring),box-shadow 0.22s ease,border-color 0.22s ease;
+  transform:perspective(1000px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg)) translate3d(0, var(--lift-y, 0px), 0);
+}
+.card-3d:hover{
+  --lift-y:-4px;
+  border-color:var(--border-hover);
+  box-shadow:var(--shadow-3d-hover);
+}
+.specular-border{position:relative}
+.specular-border::before{
+  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.12),transparent 40%,transparent 60%,rgba(99,102,241,0.1));
+  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;
+}
+
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:0.01ms!important;animation-iteration-count:1!important;transition-duration:0.01ms!important;transform:none!important}
+  .card-3d{transform:none!important}
+  body::before,body::after{animation:none!important}
+}
+@media (pointer: coarse),(max-width: 768px){
+  .card-3d{transform:none!important;transition:transform 0.15s ease!important}
+  .card-3d:hover{transform:translateY(-2px)!important}
+}
+
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;overflow-x:hidden}
+body{
+  background:var(--bg-space,#030712);
+  color:var(--text);
+  font-family:var(--sans);
+  min-height:100vh;
+  overflow-x:hidden;
+  position:relative;
+}
 
-/* Animated mesh gradient background */
-body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
+/* ═══ GLOBAL 3D BACKGROUND ENGINE (GPU ACCELERATED 60FPS) ═══ */
+/* Layer 1: Ambient Volumetric Radial Glow Orbs */
+body::before{
+  content:'';
+  position:fixed;
+  inset:-10%;
+  width:120%;
+  height:120%;
+  z-index:0;
+  pointer-events:none;
   background:
-    radial-gradient(ellipse 600px 400px at 10% 20%, color-mix(in srgb, var(--mesh-1) 12%, transparent) 0%, transparent 70%),
-    radial-gradient(ellipse 500px 500px at 85% 80%, color-mix(in srgb, var(--mesh-2) 10%, transparent) 0%, transparent 70%),
-    radial-gradient(ellipse 400px 300px at 50% 50%, color-mix(in srgb, var(--mesh-3) 6%, transparent) 0%, transparent 70%);
-  animation:meshMove 20s ease-in-out infinite alternate}
-@keyframes meshMove{0%{filter:hue-rotate(0deg)}50%{filter:hue-rotate(15deg)}100%{filter:hue-rotate(-10deg)}}
-body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
-  background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);
-  background-size:44px 44px}
+    radial-gradient(circle 540px at 15% 20%, rgba(34,211,238,0.08) 0%, transparent 70%),
+    radial-gradient(circle 640px at 85% 75%, rgba(167,139,250,0.09) 0%, transparent 70%),
+    radial-gradient(circle 460px at 50% 40%, rgba(52,211,153,0.05) 0%, transparent 70%);
+  will-change:transform;
+  animation:ambientFloat 24s ease-in-out infinite alternate;
+}
+@keyframes ambientFloat{
+  0%{transform:translate3d(0,0,0) scale(1)}
+  50%{transform:translate3d(-20px,15px,0) scale(1.04)}
+  100%{transform:translate3d(18px,-18px,0) scale(0.98)}
+}
+
+/* Layer 2: Subtle Cybernetic Grid with Radial Vignette Depth Mask */
+body::after{
+  content:'';
+  position:fixed;
+  inset:0;
+  z-index:0;
+  pointer-events:none;
+  background-image:
+    linear-gradient(rgba(99,102,241,0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(99,102,241,0.035) 1px, transparent 1px);
+  background-size:40px 40px;
+  -webkit-mask-image:radial-gradient(ellipse 85% 75% at 50% 30%, #000 35%, transparent 95%);
+  mask-image:radial-gradient(ellipse 85% 75% at 50% 30%, #000 35%, transparent 95%);
+}
+
+/* Layer 3: Floating Quantum Micro-Particles (Single element, zero CPU) */
+.bg-particles{
+  position:fixed;
+  inset:0;
+  z-index:0;
+  pointer-events:none;
+  overflow:hidden;
+}
+.bg-particles::before{
+  content:'';
+  position:absolute;
+  pointer-events:none;
+  top:0;
+  left:0;
+  width:2px;
+  height:2px;
+  border-radius:50%;
+  box-shadow:
+    14vw 18vh 0 rgba(34,211,238,0.45),
+    32vw 45vh 0 rgba(167,139,250,0.35),
+    48vw 12vh 0 rgba(255,255,255,0.4),
+    68vw 62vh 0 rgba(52,211,153,0.35),
+    82vw 28vh 0 rgba(34,211,238,0.35),
+    22vw 78vh 0 rgba(167,139,250,0.4),
+    74vw 88vh 0 rgba(255,255,255,0.3),
+    89vw 52vh 0 rgba(34,211,238,0.4),
+    5vw 88vh 0 rgba(52,211,153,0.3);
+  animation:particleDrift 20s linear infinite alternate;
+  will-change:transform;
+}
+@keyframes particleDrift{
+  0%{transform:translate3d(0,0,0);opacity:0.55}
+  50%{transform:translate3d(15px,-24px,0);opacity:0.85}
+  100%{transform:translate3d(-12px,-45px,0);opacity:0.45}
+}
 
 .container{max-width:1280px;margin:0 auto;padding:24px 20px;position:relative;z-index:1}
 
@@ -5122,32 +5522,161 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .card+.card{margin-top:16px}
 .card-title{font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:1.8px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
 
-/* ═══ HEADER ═══ */
-.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px}
-.header-left{display:flex;align-items:center;gap:14px}
-.logo{display:flex;align-items:baseline;gap:2px}
-.logo h1{font-size:24px;font-weight:900;letter-spacing:-0.8px;color:var(--text)}
-.logo-gradient{background:linear-gradient(135deg,var(--accent),var(--accent2),var(--accent3));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.version{font-size:10px;font-weight:800;color:#fff;background:linear-gradient(135deg,var(--accent),var(--accent2));padding:3px 10px;border-radius:20px;letter-spacing:.6px;box-shadow:0 2px 8px var(--accent-glow)}
+/* ═══ 3D COMMAND HEADER & LOGO ═══ */
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px;position:relative;z-index:10}
+.header-left{display:flex;align-items:center;gap:16px}
+.logo{display:flex;align-items:baseline;gap:6px;perspective:600px;cursor:default;transition:transform 0.25s var(--ease-spring)}
+.logo:hover{transform:perspective(600px) rotateX(3deg) rotateY(-3deg) scale(1.02)}
+.logo h1{
+  font-size:26px;
+  font-weight:900;
+  letter-spacing:-0.8px;
+  color:#f8fafc;
+  text-shadow:
+    0 1px 0 #6366f1,
+    0 2px 0 #4f46e5,
+    0 3px 0 #4338ca,
+    0 6px 14px rgba(0,0,0,0.8),
+    0 0 24px rgba(99,102,241,0.5);
+}
+.logo-gradient{
+  background:linear-gradient(135deg,#22d3ee 0%,#818cf8 50%,#c084fc 100%);
+  -webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;
+  background-clip:text;
+}
+.version{
+  font-size:10px;
+  font-weight:800;
+  color:#fff;
+  background:linear-gradient(135deg,rgba(99,102,241,0.4),rgba(167,139,250,0.3));
+  border:1px solid rgba(34,211,238,0.5);
+  padding:3px 10px;
+  border-radius:20px;
+  letter-spacing:.8px;
+  box-shadow:0 0 14px rgba(34,211,238,0.3), inset 0 1px 1px rgba(255,255,255,0.4);
+  backdrop-filter:blur(8px);
+}
 .header-sub{font-size:11px;color:var(--text-dim);font-family:var(--mono)}
 .header-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.theme-pill{display:flex;gap:2px;background:var(--surface);border:1px solid var(--border);border-radius:24px;padding:3px}
+.theme-pill{display:flex;gap:2px;background:rgba(8,12,24,0.8);border:1px solid var(--border);border-radius:24px;padding:3px;backdrop-filter:blur(8px)}
 .t-btn{padding:5px 12px;border-radius:20px;border:none;background:transparent;color:var(--text-dim);font-size:10px;font-weight:700;cursor:pointer;transition:all .2s;font-family:var(--sans)}
 .t-btn.active,.t-btn:hover{background:var(--accent);color:#fff;box-shadow:0 0 10px var(--accent-glow)}
-.status-pill{display:flex;align-items:center;gap:8px;background:var(--glass-bg);backdrop-filter:blur(12px);border:1px solid var(--glass-border);padding:7px 16px;border-radius:24px;font-size:12px;font-weight:700}
+.status-pill{display:flex;align-items:center;gap:8px;background:rgba(13,19,36,0.7);backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,0.08);padding:7px 16px;border-radius:24px;font-size:12px;font-weight:700;box-shadow:0 4px 14px rgba(0,0,0,0.4)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green);animation:pulse 1.5s infinite}
 .dot.paused{background:var(--yellow);box-shadow:0 0 10px var(--yellow);animation:none}
 .dot.stopped{background:var(--red);box-shadow:0 0 10px var(--red);animation:none}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(1.15)}}
 
-/* ═══ TABS ═══ */
-.tabs{display:flex;gap:4px;background:var(--glass-bg);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border:1px solid var(--glass-border);border-radius:14px;padding:5px;margin-bottom:22px;overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none}
+/* ═══ 3D HOLOGRAPHIC AI AUTOPILOT ORB ═══ */
+.ai-orb-container{
+  position:relative;
+  width:50px;
+  height:50px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  perspective:600px;
+  flex-shrink:0;
+}
+.ai-orb-sphere{
+  width:32px;
+  height:32px;
+  border-radius:50%;
+  background:radial-gradient(circle at 35% 35%, #22d3ee 0%, #818cf8 50%, #030712 95%);
+  box-shadow:0 0 24px rgba(34,211,238,0.5), inset 0 0 10px rgba(255,255,255,0.6);
+  animation:aiOrbPulse 4s ease-in-out infinite alternate;
+  position:relative;
+  z-index:2;
+}
+.ai-orb-core{
+  position:absolute;
+  inset:4px;
+  border-radius:50%;
+  background:radial-gradient(circle at 30% 30%, rgba(255,255,255,0.8), transparent 60%);
+}
+.ai-orb-ring{
+  position:absolute;
+  border-radius:50%;
+  pointer-events:none;
+}
+.ai-orb-ring.ring-1{
+  width:50px;
+  height:50px;
+  border:1.5px solid rgba(34,211,238,0.65);
+  border-top-color:transparent;
+  border-bottom-color:transparent;
+  transform:rotateX(68deg) rotateY(15deg);
+  animation:orbRing1 6s linear infinite;
+}
+.ai-orb-ring.ring-2{
+  width:44px;
+  height:44px;
+  border:1.5px solid rgba(167,139,250,0.65);
+  border-left-color:transparent;
+  border-right-color:transparent;
+  transform:rotateX(68deg) rotateY(-25deg);
+  animation:orbRing2 8s linear infinite reverse;
+}
+@keyframes aiOrbPulse{
+  0%{transform:scale(0.96);box-shadow:0 0 16px rgba(34,211,238,0.4)}
+  100%{transform:scale(1.06);box-shadow:0 0 28px rgba(34,211,238,0.7), 0 0 14px rgba(167,139,250,0.5)}
+}
+@keyframes orbRing1{
+  0%{transform:rotateX(68deg) rotateY(15deg) rotateZ(0deg)}
+  100%{transform:rotateX(68deg) rotateY(15deg) rotateZ(360deg)}
+}
+@keyframes orbRing2{
+  0%{transform:rotateX(68deg) rotateY(-25deg) rotateZ(0deg)}
+  100%{transform:rotateX(68deg) rotateY(-25deg) rotateZ(360deg)}
+}
+
+/* ═══ 3D GLASS TABS NAVIGATION ═══ */
+.tabs{
+  display:flex;
+  gap:6px;
+  background:rgba(8,12,24,0.78);
+  backdrop-filter:blur(18px);
+  -webkit-backdrop-filter:blur(18px);
+  border:1px solid rgba(255,255,255,0.08);
+  border-radius:16px;
+  padding:6px;
+  margin-bottom:22px;
+  overflow-x:auto;
+  scrollbar-width:none;
+  box-shadow:0 12px 36px -8px rgba(0,0,0,0.65), 0 0 16px -4px rgba(99,102,241,0.2);
+}
 .tabs::-webkit-scrollbar{display:none;width:0;height:0}
-.tab-btn{padding:9px 16px;border-radius:10px;border:none;background:transparent;color:var(--text-dim);font-family:var(--sans);font-size:12px;font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap;display:flex;align-items:center;gap:6px}
-.tab-btn:hover{color:var(--text);background:rgba(255,255,255,0.05);transform:translateY(-1px)}
-.tab-btn.active{background:linear-gradient(135deg,rgba(129,140,248,0.2),rgba(167,139,250,0.12));color:#fff;box-shadow:0 2px 12px rgba(99,102,241,0.25);border:1px solid var(--border)}
+.tab-btn{
+  padding:10px 18px;
+  border-radius:12px;
+  border:1px solid transparent;
+  background:transparent;
+  color:var(--text-dim);
+  font-family:var(--sans);
+  font-size:12px;
+  font-weight:700;
+  cursor:pointer;
+  transition:all 0.2s var(--ease-spring);
+  white-space:nowrap;
+  display:flex;
+  align-items:center;
+  gap:7px;
+}
+.tab-btn:hover{
+  color:var(--text);
+  background:rgba(255,255,255,0.06);
+  transform:translate3d(0, -2px, 0) scale(1.02);
+}
+.tab-btn.active{
+  background:linear-gradient(135deg,rgba(34,211,238,0.22) 0%,rgba(129,140,248,0.25) 50%,rgba(167,139,250,0.2) 100%);
+  color:#fff;
+  box-shadow:0 4px 18px -2px rgba(34,211,238,0.35), inset 0 1px 1px rgba(255,255,255,0.3);
+  border:1px solid rgba(34,211,238,0.4);
+  transform:translate3d(0, -1px, 0);
+}
 .tab-panel{display:none}
-.tab-panel.active{display:block;animation:fadeSlide .3s cubic-bezier(.16,1,.3,1)}
+.tab-panel.active{display:block;animation:fadeSlide .28s cubic-bezier(.16,1,.3,1)}
 @keyframes fadeSlide{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 
 /* ═══ PROGRESS BAR & SPEED GROUP UTILITIES ═══ */
@@ -5174,14 +5703,67 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .prog-meta span{font-size:11px;color:var(--text-dim);font-weight:600}
 .prog-meta strong{color:var(--text);font-weight:800;font-variant-numeric:tabular-nums}
 
-/* ═══ STAT CARDS ═══ */
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;transition:all .25s;cursor:pointer;position:relative;overflow:hidden}
-.stat:hover{border-color:var(--border-hover);transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,0.3)}
-.stat-icon{font-size:20px;margin-bottom:8px}
-.stat-val{font-size:28px;font-weight:900;line-height:1;margin-bottom:3px;font-variant-numeric:tabular-nums;transition:color .2s}
-.stat-val.g{color:var(--green)}.stat-val.r{color:var(--red)}.stat-val.y{color:var(--yellow)}.stat-val.b{color:var(--blue)}.stat-val.p{color:var(--purple)}.stat-val.o{color:var(--orange)}
-.stat-lbl{font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;font-weight:700}
+/* ═══ 3D METRIC STAT CARDS ═══ */
+.stats{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+  gap:14px;
+  margin-bottom:18px;
+  perspective:1000px;
+}
+.stat{
+  background:rgba(13,19,36,0.65);
+  border:1px solid rgba(99,102,241,0.18);
+  border-radius:16px;
+  padding:20px;
+  cursor:pointer;
+  position:relative;
+  overflow:hidden;
+  backdrop-filter:blur(14px);
+  -webkit-backdrop-filter:blur(14px);
+  transform-style:preserve-3d;
+  will-change:transform,box-shadow;
+  transition:transform 0.22s var(--ease-spring),border-color 0.22s ease,box-shadow 0.22s ease;
+  transform:perspective(1000px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg)) translate3d(0, var(--lift-y, 0px), 0);
+  box-shadow:0 12px 30px -8px rgba(0,0,0,0.55), 0 0 12px -4px rgba(99,102,241,0.15);
+}
+.stat::before{
+  content:'';
+  position:absolute;
+  inset:0;
+  border-radius:inherit;
+  padding:1px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.15),transparent 45%,transparent 60%,rgba(99,102,241,0.12));
+  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  -webkit-mask-composite:xor;
+  mask-composite:exclude;
+  pointer-events:none;
+}
+.stat::after{
+  content:'';
+  position:absolute;
+  inset:0;
+  border-radius:inherit;
+  background:radial-gradient(circle 180px at var(--sheen-x, 50%) var(--sheen-y, 50%), rgba(255,255,255,0.07), transparent 70%);
+  pointer-events:none;
+  opacity:0;
+  transition:opacity 0.2s ease;
+}
+.stat:hover::after{opacity:1}
+.stat:hover{
+  --lift-y:-5px;
+  border-color:rgba(99,102,241,0.45);
+  box-shadow:0 22px 50px -10px rgba(0,0,0,0.7), 0 0 24px -4px var(--accent-glow);
+}
+.stat-icon{font-size:22px;margin-bottom:8px;transform:translateZ(10px)}
+.stat-val{font-size:30px;font-weight:900;line-height:1;margin-bottom:4px;font-variant-numeric:tabular-nums;transform:translateZ(15px);text-shadow:0 2px 8px rgba(0,0,0,0.5)}
+.stat-val.g{color:var(--green);text-shadow:0 0 14px var(--green-glow)}
+.stat-val.r{color:var(--red);text-shadow:0 0 14px var(--red-glow)}
+.stat-val.y{color:var(--yellow);text-shadow:0 0 14px var(--yellow-glow)}
+.stat-val.b{color:var(--blue);text-shadow:0 0 14px var(--blue-glow)}
+.stat-val.p{color:var(--purple);text-shadow:0 0 14px var(--accent-glow)}
+.stat-val.o{color:var(--orange)}
+.stat-lbl{font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;font-weight:700;transform:translateZ(8px)}
 .stat-spark{height:24px;margin-top:8px;opacity:.5}
 
 /* ═══ CONTROLS ═══ */
@@ -5740,16 +6322,197 @@ html, body {
     grid-template-columns: repeat(2, 1fr) !important;
   }
 }
+
+/* ═══════════════ PHASE 4: GLOBAL 3D DEPTH UPGRADE ═══════════════ */
+
+/* ═══ 3D ANALYTICS METRICS ═══ */
+.a-metric.card-3d{
+  transform-style:preserve-3d;
+  will-change:transform,box-shadow;
+  transition:transform 0.22s var(--ease-spring),border-color 0.22s ease,box-shadow 0.22s ease;
+  transform:perspective(1000px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg)) translate3d(0, var(--lift-y, 0px), 0);
+  box-shadow:0 10px 28px -6px rgba(0,0,0,0.5), 0 0 12px -4px rgba(99,102,241,0.12);
+  position:relative;
+  overflow:hidden;
+}
+.a-metric.card-3d::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;
+  background:radial-gradient(circle 150px at var(--sheen-x, 50%) var(--sheen-y, 50%), rgba(255,255,255,0.06), transparent 70%);
+  pointer-events:none;opacity:0;transition:opacity 0.2s ease;
+}
+.a-metric.card-3d:hover::after{opacity:1}
+.a-metric.card-3d:hover{
+  --lift-y:-4px;
+  border-color:var(--border-hover);
+  box-shadow:0 20px 44px -8px rgba(0,0,0,0.65), 0 0 22px -4px var(--accent-glow);
+}
+
+/* ═══ 3D FUNNEL CARDS ═══ */
+.funnel-card.card-3d{
+  transform-style:preserve-3d;
+  will-change:transform;
+  transition:transform 0.22s var(--ease-spring),border-color 0.22s ease,box-shadow 0.22s ease;
+  transform:perspective(1000px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg)) translate3d(0, var(--lift-y, 0px), 0);
+  box-shadow:0 8px 20px -4px rgba(0,0,0,0.4);
+  position:relative;overflow:hidden;
+}
+.funnel-card.card-3d::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;
+  background:radial-gradient(circle 120px at var(--sheen-x, 50%) var(--sheen-y, 50%), rgba(255,255,255,0.05), transparent 70%);
+  pointer-events:none;opacity:0;transition:opacity 0.2s ease;
+}
+.funnel-card.card-3d:hover::after{opacity:1}
+.funnel-card.card-3d:hover{--lift-y:-3px;border-color:var(--border-hover);box-shadow:0 16px 36px -6px rgba(0,0,0,0.55), 0 0 16px -4px var(--accent-glow)}
+
+/* ═══ 3D CHART CARDS ═══ */
+.chart-card.card-3d{
+  transform-style:preserve-3d;
+  will-change:transform;
+  transition:transform 0.25s var(--ease-spring),border-color 0.25s ease,box-shadow 0.25s ease;
+  transform:perspective(1000px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg));
+  box-shadow:0 12px 30px -6px rgba(0,0,0,0.5), 0 0 14px -4px rgba(99,102,241,0.12);
+}
+.chart-card.card-3d:hover{
+  border-color:var(--border-hover);
+  box-shadow:0 20px 44px -8px rgba(0,0,0,0.65), 0 0 22px -4px var(--accent-glow);
+}
+
+/* ═══ GLASS COMMAND CARDS (Autopilot, Campaign Header) ═══ */
+.glass-command{
+  background:var(--glass-bg);
+  backdrop-filter:blur(22px) saturate(1.5);
+  -webkit-backdrop-filter:blur(22px) saturate(1.5);
+  border:1px solid var(--glass-border);
+  box-shadow:0 16px 40px -8px rgba(0,0,0,0.55), 0 0 16px -4px rgba(99,102,241,0.15);
+  position:relative;overflow:hidden;
+  transition:border-color 0.3s,box-shadow 0.3s;
+}
+.glass-command::before{
+  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.1),transparent 40%,transparent 60%,rgba(99,102,241,0.08));
+  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;
+}
+.glass-command:hover{
+  border-color:var(--border-hover);
+  box-shadow:0 20px 50px -10px rgba(0,0,0,0.7), 0 0 24px -4px var(--accent-glow);
+}
+
+/* ═══ 3D TABLE DEPTH (Jobs, Emails, Interviews) ═══ */
+.jobs-table tr td{transition:background 0.15s ease,box-shadow 0.15s ease}
+.jobs-table tbody tr:hover{
+  transform:scale(1.003);
+  box-shadow:0 4px 16px -4px rgba(99,102,241,0.15);
+}
+.jobs-table tbody tr:hover td{background:rgba(129,140,248,0.04)}
+
+/* ═══ ENHANCED KANBAN 3D ═══ */
+.kanban-card.card-3d{
+  transform-style:preserve-3d;
+  transition:transform 0.2s var(--ease-spring),border-color 0.2s ease,box-shadow 0.2s ease;
+  transform:perspective(800px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg));
+}
+.kanban-card.card-3d:hover{
+  border-color:var(--border-hover);
+  box-shadow:0 12px 28px -4px rgba(0,0,0,0.5), 0 0 14px -4px var(--accent-glow);
+}
+
+/* ═══ SCROLL-REVEAL MICRO-ANIMATION ═══ */
+.reveal-3d{
+  opacity:0;
+  transform:translateY(20px) perspective(600px) rotateX(2deg);
+  transition:opacity 0.5s var(--ease-spring), transform 0.5s var(--ease-spring);
+}
+.reveal-3d.visible{
+  opacity:1;
+  transform:translateY(0) perspective(600px) rotateX(0);
+}
+
+/* ═══ STREAK CARD 3D ═══ */
+.streak-card.card-3d{
+  transform-style:preserve-3d;
+  transition:transform 0.22s var(--ease-spring),box-shadow 0.22s ease;
+  transform:perspective(800px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg));
+  box-shadow:0 10px 28px -6px rgba(0,0,0,0.5), 0 0 12px -4px rgba(251,191,36,0.2);
+}
+.streak-card.card-3d:hover{
+  box-shadow:0 18px 40px -8px rgba(0,0,0,0.65), 0 0 22px -4px rgba(251,191,36,0.35);
+}
+
+/* ═══ HEALTH MONITOR 3D ITEMS ═══ */
+.health-item.card-3d{
+  transform-style:preserve-3d;
+  transition:transform 0.2s var(--ease-spring),border-color 0.2s ease,box-shadow 0.2s ease;
+  transform:perspective(800px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg));
+  position:relative;overflow:hidden;
+}
+.health-item.card-3d::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;
+  background:radial-gradient(circle 120px at var(--sheen-x, 50%) var(--sheen-y, 50%), rgba(255,255,255,0.05), transparent 70%);
+  pointer-events:none;opacity:0;transition:opacity 0.2s ease;
+}
+.health-item.card-3d:hover::after{opacity:1}
+.health-item.card-3d:hover{--lift-y:-3px;border-color:var(--border-hover)}
+
+/* ═══ DROP ZONE 3D ENHANCEMENT ═══ */
+.drop-zone{
+  transition:all 0.25s var(--ease-spring);
+  position:relative;overflow:hidden;
+}
+.drop-zone:hover,.drop-zone.drag-active{
+  transform:translateY(-2px);
+  box-shadow:0 8px 24px -4px rgba(129,140,248,0.2);
+}
+
+/* ═══ SETTINGS SECTION GLASS ═══ */
+.settings-section.glass-command{
+  backdrop-filter:blur(16px) saturate(1.3);
+  -webkit-backdrop-filter:blur(16px) saturate(1.3);
+}
+
+/* ═══ MODAL 3D POP ═══ */
+.modal-box{
+  transform-style:preserve-3d;
+}
+@keyframes modalPop3D{
+  from{opacity:0;transform:scale(.9) rotateX(4deg) translateY(16px)}
+  to{opacity:1;transform:scale(1) rotateX(0) translateY(0)}
+}
+
+/* ═══ NOTIFICATION DROPDOWN 3D ═══ */
+.notif-dropdown.open{
+  animation:modalPop3D 0.25s var(--ease-spring);
+}
+
+/* ═══ CAMPAIGN COOLDOWN STAT CARDS 3D ═══ */
+.cd-stat-3d{
+  transition:transform 0.2s var(--ease-spring),box-shadow 0.2s ease;
+  position:relative;overflow:hidden;
+}
+.cd-stat-3d:hover{
+  transform:translateY(-3px);
+  box-shadow:0 10px 28px -4px rgba(0,0,0,0.5);
+}
+
+/* ═══ FLOATING GLOW LINE (Tab underline) ═══ */
+.tabs{position:relative}
+.tabs::after{
+  content:'';position:absolute;bottom:0;left:50%;
+  width:60%;height:1px;
+  transform:translateX(-50%);
+  background:linear-gradient(90deg,transparent,rgba(34,211,238,0.2),rgba(129,140,248,0.25),rgba(167,139,250,0.2),transparent);
+}
 </style>
 </head>
 <body>
+<div class="bg-particles" aria-hidden="true"></div>
 <div class="container">
 
   <!-- ═══ HEADER ═══ -->
   <div class="header">
     <div class="header-left">
       <div>
-        <div class="logo"><h1>Resume<span class="logo-gradient">Auto</span></h1>&nbsp;<span class="version">v7.0 TITAN</span></div>
+        <div class="logo logo-3d" title="ResumeAuto 3D TITAN — AI Command Center"><h1>Resume<span class="logo-gradient">Auto</span></h1>&nbsp;<span class="version">V8.0 TITAN</span></div>
         <div class="header-sub" id="sub">Initializing...</div>
       </div>
     </div>
@@ -5813,10 +6576,17 @@ html, body {
   <!-- ══════════ DASHBOARD TAB ══════════ -->
   <div id="panel-dashboard" class="tab-panel active">
     <!-- ═══ v8.6: AUTOPILOT COMMAND CENTER ═══ -->
-    <div class="card" id="autopilot-command-card" style="margin-bottom:14px;background:linear-gradient(135deg,rgba(99,102,241,0.08) 0%,rgba(168,85,247,0.05) 100%);border:1px solid rgba(139,92,246,0.3);position:relative;overflow:hidden">
+    <div class="card glass-command card-3d" id="autopilot-command-card" style="margin-bottom:14px;background:linear-gradient(135deg,rgba(99,102,241,0.08) 0%,rgba(168,85,247,0.05) 100%);border:1px solid rgba(139,92,246,0.3);position:relative;overflow:hidden">
       <div class="ap-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
-        <div style="display:flex;align-items:center;gap:12px">
-          <div style="font-size:24px;width:42px;height:42px;border-radius:10px;background:rgba(99,102,241,0.18);display:flex;align-items:center;justify-content:center;border:1px solid rgba(99,102,241,0.4)">🤖</div>
+        <div style="display:flex;align-items:center;gap:14px">
+          <!-- 3D Holographic AI Autopilot Orb -->
+          <div class="ai-orb-container" title="3D Autonomous Outreach AI Core">
+            <div class="ai-orb-sphere" id="dash-ai-orb">
+              <div class="ai-orb-core"></div>
+            </div>
+            <div class="ai-orb-ring ring-1"></div>
+            <div class="ai-orb-ring ring-2"></div>
+          </div>
           <div>
             <div style="display:flex;align-items:center;gap:8px">
               <span style="font-size:14px;font-weight:800;letter-spacing:0.3px">Autonomous Outreach Autopilot</span>
@@ -5886,17 +6656,17 @@ html, body {
       <div class="timeline" id="milestones-timeline"></div>
     </div>
 
-    <!-- Stats -->
-    <div class="stats">
-      <div class="stat" onclick="switchTab('jobs',document.getElementById('tab-jobs'))" title="View Jobs">
+    <!-- 3D Volumetric Stats Grid -->
+    <div class="stats perspective-root">
+      <div class="stat card-3d" onclick="switchTab('jobs',document.getElementById('tab-jobs'))" title="View Jobs">
         <div class="stat-icon">&#x2705;</div><div class="stat-val g" id="ss">0</div><div class="stat-lbl">Sent</div>
       </div>
-      <div class="stat" onclick="switchTab('analytics',document.getElementById('tab-analytics'))" title="View Analytics">
+      <div class="stat card-3d" onclick="switchTab('analytics',document.getElementById('tab-analytics'))" title="View Analytics">
         <div class="stat-icon">&#x274C;</div><div class="stat-val r" id="sf">0</div><div class="stat-lbl">Failed</div>
       </div>
-      <div class="stat"><div class="stat-icon">&#x23ED;&#xFE0F;</div><div class="stat-val y" id="sk">0</div><div class="stat-lbl">Skipped</div></div>
-      <div class="stat"><div class="stat-icon">&#x1F504;</div><div class="stat-val b" id="sr">0</div><div class="stat-lbl">Retried</div></div>
-      <div class="stat" onclick="switchTab('jobs',document.getElementById('tab-jobs'))">
+      <div class="stat card-3d"><div class="stat-icon">&#x23ED;&#xFE0F;</div><div class="stat-val y" id="sk">0</div><div class="stat-lbl">Skipped</div></div>
+      <div class="stat card-3d"><div class="stat-icon">&#x1F504;</div><div class="stat-val b" id="sr">0</div><div class="stat-lbl">Retried</div></div>
+      <div class="stat card-3d" onclick="switchTab('jobs',document.getElementById('tab-jobs'))">
         <div class="stat-icon">&#x1F4CB;</div><div class="stat-val p" id="sj">0</div><div class="stat-lbl">Jobs Tracked</div>
       </div>
     </div>
@@ -5904,12 +6674,12 @@ html, body {
     <!-- Funnel -->
     <div class="card" style="margin-bottom:16px;padding:16px 18px">
       <div class="card-title">&#x1F4CA; Outreach &amp; Engagement Funnel</div>
-      <div class="funnel-grid">
-        <div class="funnel-card"><div class="f-val" id="fn-sent" style="color:var(--text)">0</div><div class="f-lbl">&#x1F4E4; Sent</div></div>
-        <div class="funnel-card"><div class="f-val" id="fn-opened" style="color:var(--blue)">0</div><div class="f-lbl">&#x1F441; Opened (<span id="fn-open-rate">0%</span>)</div></div>
-        <div class="funnel-card"><div class="f-val" id="fn-resume" style="color:var(--accent2)">0</div><div class="f-lbl">&#x1F4C4; Resume (<span id="fn-click-rate">0%</span>)</div></div>
-        <div class="funnel-card"><div class="f-val" id="fn-replied" style="color:var(--green)">0</div><div class="f-lbl">&#x1F4AC; Replies (<span id="fn-reply-rate">0%</span>)</div></div>
-        <div class="funnel-card"><div class="f-val" id="fn-interviews" style="color:var(--yellow)">0</div><div class="f-lbl">&#x1F3AF; Interviews</div></div>
+      <div class="funnel-grid perspective-root">
+        <div class="funnel-card card-3d"><div class="f-val" id="fn-sent" style="color:var(--text)">0</div><div class="f-lbl">&#x1F4E4; Sent</div></div>
+        <div class="funnel-card card-3d"><div class="f-val" id="fn-opened" style="color:var(--blue)">0</div><div class="f-lbl">&#x1F441; Opened (<span id="fn-open-rate">0%</span>)</div></div>
+        <div class="funnel-card card-3d"><div class="f-val" id="fn-resume" style="color:var(--accent2)">0</div><div class="f-lbl">&#x1F4C4; Resume (<span id="fn-click-rate">0%</span>)</div></div>
+        <div class="funnel-card card-3d"><div class="f-val" id="fn-replied" style="color:var(--green)">0</div><div class="f-lbl">&#x1F4AC; Replies (<span id="fn-reply-rate">0%</span>)</div></div>
+        <div class="funnel-card card-3d"><div class="f-val" id="fn-interviews" style="color:var(--yellow)">0</div><div class="f-lbl">&#x1F3AF; Interviews</div></div>
       </div>
     </div>
 
@@ -6161,17 +6931,17 @@ html, body {
 
   <!-- ══════════ ANALYTICS TAB ══════════ -->
   <div id="panel-analytics" class="tab-panel">
-    <div class="analytics-top">
-      <div class="a-metric"><div class="a-val g" id="a-total-log">0</div><div class="a-lbl">Total Sent</div></div>
-      <div class="a-metric"><div class="a-val b" id="a-success-rate">0%</div><div class="a-lbl">Success Rate</div></div>
-      <div class="a-metric"><div class="a-val y" id="a-eta">&#x2014;</div><div class="a-lbl">ETA</div></div>
-      <div class="a-metric"><div class="a-val o" id="a-remaining">0</div><div class="a-lbl">Remaining</div></div>
-      <div class="a-metric"><div class="a-val p" id="a-response-rate">0%</div><div class="a-lbl">Response Rate</div></div>
+    <div class="analytics-top perspective-root">
+      <div class="a-metric card-3d"><div class="a-val g" id="a-total-log">0</div><div class="a-lbl">Total Sent</div></div>
+      <div class="a-metric card-3d"><div class="a-val b" id="a-success-rate">0%</div><div class="a-lbl">Success Rate</div></div>
+      <div class="a-metric card-3d"><div class="a-val y" id="a-eta">&#x2014;</div><div class="a-lbl">ETA</div></div>
+      <div class="a-metric card-3d"><div class="a-val o" id="a-remaining">0</div><div class="a-lbl">Remaining</div></div>
+      <div class="a-metric card-3d"><div class="a-val p" id="a-response-rate">0%</div><div class="a-lbl">Response Rate</div></div>
     </div>
 
     <!-- Streak & Goals -->
     <div style="display:grid;grid-template-columns:auto 1fr;gap:14px;margin-bottom:16px">
-      <div class="streak-card" id="streak-card">
+      <div class="streak-card card-3d" id="streak-card">
         <div class="streak-fire">&#x1F525;</div>
         <div><div class="streak-num" id="streak-num">0</div><div style="font-size:11px;color:var(--text-dim);font-weight:700">DAY STREAK</div></div>
       </div>
@@ -6184,19 +6954,19 @@ html, body {
     <!-- Conversion Funnel -->
     <div class="card" style="margin-bottom:14px">
       <div class="card-title">&#x1F4CA; Application Conversion Funnel</div>
-      <div class="funnel-grid">
-        <div class="funnel-card"><div class="f-val b" id="fn2-sent">0</div><div class="f-lbl">Sent</div></div>
-        <div class="funnel-card"><div class="f-val y" id="fn2-viewed">0</div><div class="f-lbl">Viewed</div></div>
-        <div class="funnel-card"><div class="f-val b" id="fn2-interview">0</div><div class="f-lbl">Interview</div></div>
-        <div class="funnel-card"><div class="f-val g" id="fn2-offer">0</div><div class="f-lbl">Offer &#x1F389;</div></div>
-        <div class="funnel-card"><div class="f-val o" id="fn2-rate">0%</div><div class="f-lbl">Response Rate</div></div>
+      <div class="funnel-grid perspective-root">
+        <div class="funnel-card card-3d"><div class="f-val b" id="fn2-sent">0</div><div class="f-lbl">Sent</div></div>
+        <div class="funnel-card card-3d"><div class="f-val y" id="fn2-viewed">0</div><div class="f-lbl">Viewed</div></div>
+        <div class="funnel-card card-3d"><div class="f-val b" id="fn2-interview">0</div><div class="f-lbl">Interview</div></div>
+        <div class="funnel-card card-3d"><div class="f-val g" id="fn2-offer">0</div><div class="f-lbl">Offer &#x1F389;</div></div>
+        <div class="funnel-card card-3d"><div class="f-val o" id="fn2-rate">0%</div><div class="f-lbl">Response Rate</div></div>
       </div>
       <div id="svg-funnel" style="margin-top:14px;overflow-x:auto"></div>
     </div>
 
-    <div class="charts-grid">
-      <div class="chart-card"><h3>&#x1F31F; Session Results</h3><canvas id="chart-donut" width="260" height="260"></canvas></div>
-      <div class="chart-card"><h3>&#x1F4C5; Emails Per Day</h3><canvas id="chart-bar" height="200"></canvas></div>
+    <div class="charts-grid perspective-root">
+      <div class="chart-card card-3d"><h3>&#x1F31F; Session Results</h3><canvas id="chart-donut" width="260" height="260"></canvas></div>
+      <div class="chart-card card-3d"><h3>&#x1F4C5; Emails Per Day</h3><canvas id="chart-bar" height="200"></canvas></div>
     </div>
 
     <!-- ═══ v7.0: CUMULATIVE GROWTH & SEND VELOCITY ═══ -->
@@ -6701,6 +7471,70 @@ html, body {
         </div>
       </div>
     </div>
+
+    <!-- 🛡️ Personal & Custom Blocked Domains Shield (Phase 2 Upgrade) -->
+    <div class="card" style="margin-top:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+        <div>
+          <div class="card-title" style="margin:0;display:flex;align-items:center;gap:8px">
+            <span>🛡️ Personal &amp; Custom Blocked Domains Shield</span>
+            <span class="badge" style="background:rgba(56,189,248,0.15);color:#38bdf8;font-size:11px">13-Stage Safety Engine</span>
+          </div>
+          <p style="font-size:11px;color:var(--text-dim);margin-top:2px">
+            Protects your primary sending domain from high spam complaints by blocking personal webmail providers (@gmail, @yahoo, @outlook, etc.) and disposable temporary email generators. You can also block any corporate domain manually.
+          </p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-ghost" onclick="loadBlockedDomainsUI()" style="font-size:11px;padding:4px 8px">🔄 Refresh</button>
+        </div>
+      </div>
+
+      <!-- Real-Time Single Email Safety Tester -->
+      <div style="background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:16px">
+        <div style="font-size:12px;font-weight:700;color:var(--text-bright);margin-bottom:6px">⚡ Real-Time Email Safety Audit (Single Recipient)</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <input class="form-input" id="safety-test-email" placeholder="Type or paste any email (e.g. hr@google.com, applicant@gmail.com, test@temp-mail.org)..." style="flex:1;min-width:260px" onkeydown="if(event.key==='Enter')testEmailSafetyUI()"/>
+          <button class="btn btn-b" onclick="testEmailSafetyUI()">🔍 Audit Recipient</button>
+        </div>
+        <div id="safety-test-result" style="display:none;margin-top:10px;padding:10px;border-radius:6px;font-size:12px"></div>
+      </div>
+
+      <!-- Add Custom Blocked Domain -->
+      <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+        <input class="form-input" id="custom-block-domain" placeholder="Domain to block (e.g. competitor.com, badlead.org)..." style="flex:1;max-width:340px" onkeydown="if(event.key==='Enter')addCustomBlockedDomainUI()"/>
+        <button class="btn btn-r" onclick="addCustomBlockedDomainUI()">🚫 Add Custom Domain Block</button>
+      </div>
+
+      <!-- Domain Badges Columns -->
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px">
+        <!-- Personal Domains Column -->
+        <div>
+          <div style="font-size:11px;font-weight:700;color:var(--text-dim);margin-bottom:8px;display:flex;justify-content:space-between">
+            <span>PERSONAL WEBMAIL (<span id="blocked-personal-count">0</span>)</span>
+            <span style="font-size:10px;color:var(--yellow)">Default Shielded</span>
+          </div>
+          <div id="blocked-personal-list" style="max-height:180px;overflow-y:auto;display:flex;flex-wrap:wrap;gap:4px;padding:6px;background:rgba(0,0,0,0.2);border-radius:6px;border:1px solid var(--border)"></div>
+        </div>
+
+        <!-- Disposable Domains Column -->
+        <div>
+          <div style="font-size:11px;font-weight:700;color:var(--text-dim);margin-bottom:8px;display:flex;justify-content:space-between">
+            <span>DISPOSABLE / TEMP (<span id="blocked-disposable-count">0</span>)</span>
+            <span style="font-size:10px;color:var(--red)">Permanent Block</span>
+          </div>
+          <div id="blocked-disposable-list" style="max-height:180px;overflow-y:auto;display:flex;flex-wrap:wrap;gap:4px;padding:6px;background:rgba(0,0,0,0.2);border-radius:6px;border:1px solid var(--border)"></div>
+        </div>
+
+        <!-- Custom Domains Column -->
+        <div>
+          <div style="font-size:11px;font-weight:700;color:var(--text-dim);margin-bottom:8px;display:flex;justify-content:space-between">
+            <span>CUSTOM RULES (<span id="blocked-custom-count">0</span>)</span>
+            <span style="font-size:10px;color:var(--cyan)">User Blocked</span>
+          </div>
+          <div id="blocked-custom-list" style="max-height:180px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding:6px;background:rgba(0,0,0,0.2);border-radius:6px;border:1px solid var(--border)"></div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- ══════════ 3. ACTIVITY LOG & HEALTH TAB ══════════ -->
@@ -6764,7 +7598,7 @@ html, body {
 
   <!-- ══════════ CAMPAIGNS TAB (Section 20) ══════════ -->
   <div id="panel-campaigns" class="tab-panel">
-    <div class="card" style="margin-bottom:16px;background:linear-gradient(135deg,rgba(99,102,241,0.08) 0%,rgba(168,85,247,0.05) 100%);border:1px solid rgba(139,92,246,0.3)">
+    <div class="card glass-command card-3d" style="margin-bottom:16px;background:linear-gradient(135deg,rgba(99,102,241,0.08) 0%,rgba(168,85,247,0.05) 100%);border:1px solid rgba(139,92,246,0.3)">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:14px">
         <div>
           <div style="display:flex;align-items:center;gap:10px">
@@ -6805,14 +7639,14 @@ html, body {
     </div>
 
     <!-- Campaign Metrics Grid -->
-    <div class="stats" style="margin-bottom:16px">
-      <div class="stat"><div class="stat-icon">💼</div><div class="stat-val" id="camp-stat-jobs" style="color:var(--accent)">0</div><div class="stat-lbl">Jobs Tracked</div></div>
-      <div class="stat"><div class="stat-icon">🎯</div><div class="stat-val" id="camp-stat-matched" style="color:var(--blue)">0</div><div class="stat-lbl">Matched</div></div>
-      <div class="stat"><div class="stat-icon">⏳</div><div class="stat-val" id="camp-stat-queued" style="color:var(--yellow)">0</div><div class="stat-lbl">Queued Leads</div></div>
-      <div class="stat"><div class="stat-icon">🚀</div><div class="stat-val" id="camp-stat-sent" style="color:var(--green)">0</div><div class="stat-lbl">Sent Successfully</div></div>
-      <div class="stat"><div class="stat-icon">⚠️</div><div class="stat-val" id="camp-stat-failed" style="color:var(--red)">0</div><div class="stat-lbl">Failed / Bounced</div></div>
-      <div class="stat"><div class="stat-icon">💬</div><div class="stat-val" id="camp-stat-replies" style="color:var(--purple)">0</div><div class="stat-lbl">Recruiter Replies</div></div>
-      <div class="stat"><div class="stat-icon">📅</div><div class="stat-val" id="camp-stat-interviews" style="color:#fbbf24">0</div><div class="stat-lbl">Interviews Scheduled</div></div>
+    <div class="stats perspective-root" style="margin-bottom:16px">
+      <div class="stat card-3d"><div class="stat-icon">💼</div><div class="stat-val" id="camp-stat-jobs" style="color:var(--accent)">0</div><div class="stat-lbl">Jobs Tracked</div></div>
+      <div class="stat card-3d"><div class="stat-icon">🎯</div><div class="stat-val" id="camp-stat-matched" style="color:var(--blue)">0</div><div class="stat-lbl">Matched</div></div>
+      <div class="stat card-3d"><div class="stat-icon">⏳</div><div class="stat-val" id="camp-stat-queued" style="color:var(--yellow)">0</div><div class="stat-lbl">Queued Leads</div></div>
+      <div class="stat card-3d"><div class="stat-icon">🚀</div><div class="stat-val" id="camp-stat-sent" style="color:var(--green)">0</div><div class="stat-lbl">Sent Successfully</div></div>
+      <div class="stat card-3d"><div class="stat-icon">⚠️</div><div class="stat-val" id="camp-stat-failed" style="color:var(--red)">0</div><div class="stat-lbl">Failed / Bounced</div></div>
+      <div class="stat card-3d"><div class="stat-icon">💬</div><div class="stat-val" id="camp-stat-replies" style="color:var(--purple)">0</div><div class="stat-lbl">Recruiter Replies</div></div>
+      <div class="stat card-3d"><div class="stat-icon">📅</div><div class="stat-val" id="camp-stat-interviews" style="color:#fbbf24">0</div><div class="stat-lbl">Interviews Scheduled</div></div>
     </div>
 
     <!-- ══════════ QUICK CAMPAIGN PASTE (Daily Emails) ══════════ -->
@@ -7122,6 +7956,59 @@ if('Notification' in window&&Notification.permission==='default')Notification.re
 function setTheme(t,btn){document.documentElement.setAttribute('data-theme',t);document.querySelectorAll('.t-btn').forEach(function(b){b.classList.remove('active')});if(btn)btn.classList.add('active');try{localStorage.setItem('ra-theme',t)}catch(e){}}
 (function(){try{var t=localStorage.getItem('ra-theme');if(t){document.documentElement.setAttribute('data-theme',t);setTimeout(function(){document.querySelectorAll('.t-btn').forEach(function(b){b.classList.toggle('active',b.textContent.toLowerCase().includes(t))})},100)}}catch(e){}})();
 
+// ══════════ ZERO-LAG 3D TILT ENGINE ══════════
+function init3DTiltEngine(){
+  if(window.matchMedia('(pointer: coarse)').matches || window.matchMedia('(prefers-reduced-motion: reduce)').matches || window.innerWidth < 768){
+    return;
+  }
+  var elements = document.querySelectorAll('.stat, .card-3d, .tilt-3d, .logo-3d');
+  elements.forEach(function(el){
+    if(el._tiltInitialized) return;
+    el._tiltInitialized = true;
+    var rect = null;
+    var rafId = null;
+
+    function onPointerEnter(e){
+      rect = el.getBoundingClientRect();
+    }
+
+    function onPointerMove(e){
+      if(!rect) rect = el.getBoundingClientRect();
+      var x = (e.clientX - rect.left);
+      var y = (e.clientY - rect.top);
+      var px = x / (rect.width || 1);
+      var py = y / (rect.height || 1);
+      // Capped strictly at +-3.0 degrees
+      var tiltY = Math.max(-3, Math.min(3, (px - 0.5) * 6));
+      var tiltX = Math.max(-3, Math.min(3, (py - 0.5) * -6));
+
+      if(!rafId){
+        rafId = requestAnimationFrame(function(){
+          el.style.setProperty('--tilt-x', tiltX.toFixed(2) + 'deg');
+          el.style.setProperty('--tilt-y', tiltY.toFixed(2) + 'deg');
+          el.style.setProperty('--sheen-x', x.toFixed(0) + 'px');
+          el.style.setProperty('--sheen-y', y.toFixed(0) + 'px');
+          rafId = null;
+        });
+      }
+    }
+
+    function onPointerLeave(){
+      if(rafId){
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      el.style.setProperty('--tilt-x', '0deg');
+      el.style.setProperty('--tilt-y', '0deg');
+      rect = null;
+    }
+
+    el.addEventListener('pointerenter', onPointerEnter, { passive: true });
+    el.addEventListener('pointermove', onPointerMove, { passive: true });
+    el.addEventListener('pointerleave', onPointerLeave, { passive: true });
+  });
+}
+
 // ── Tab Switching ──
 function switchTab(name,btn){
   var targetPanel=document.getElementById('panel-'+name);
@@ -7143,14 +8030,15 @@ function switchTab(name,btn){
   if(name==='campaigns'){if(typeof loadCampaignsUI==='function')loadCampaignsUI()}
   if(name==='interviews'){if(typeof loadInterviewsUI==='function')loadInterviewsUI()}
   if(name==='matching'){if(typeof loadCandidateProfileUI==='function')loadCandidateProfileUI();if(typeof loadResumeProfilesUI==='function')loadResumeProfilesUI()}
-  if(name==='recruiters'){if(typeof loadRecruitersUI==='function')loadRecruitersUI();if(typeof loadSuppressionUI==='function')loadSuppressionUI()}
+  if(name==='recruiters'){if(typeof loadRecruitersUI==='function')loadRecruitersUI();if(typeof loadSuppressionUI==='function')loadSuppressionUI();if(typeof loadBlockedDomainsUI==='function')loadBlockedDomainsUI()}
   if(name==='template'){loadTemplate();loadLeadSelectorOptions()}
   if(name==='emails'){loadEmailRecordsUI();loadEmailFiles();}
-  if(name==='analytics'){loadAnalytics();setTimeout(loadAnalyticsExtra,400);if(typeof loadAbTest==='function'){loadAbTest();loadOptimalHours();loadCumulativeGrowth();loadBlacklist();loadCompanyAnalytics()};loadHourlyHeatmap()}
+  if(name==='analytics'){loadAnalytics();}
   if(name==='jobs')loadJobs('all');
   if(name==='inbox')loadInboxActivities();
   if(name==='activity'){if(typeof loadCampaignHealthUI==='function')loadCampaignHealthUI();if(typeof loadActivityLogsUI==='function')loadActivityLogsUI()}
   if(name==='settings'){loadSettings();loadHealthData()}
+  setTimeout(init3DTiltEngine, 80);
 }
 
 window.addEventListener('popstate', function(){
@@ -7386,29 +8274,363 @@ async function verifySingleEmailUI(){try{var btn=document.getElementById('v-veri
 async function discoverLeadsUI(){try{var btn=document.getElementById('lead-find-btn');if(btn)btn.disabled=true;var domInp=document.getElementById('lead-domain-input');var compInp=document.getElementById('lead-company-input');var r=await fetch('/api/leads/discover',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domInp?domInp.value:'',company:compInp?compInp.value:''})});var d=await r.json();var box=document.getElementById('lead-results-box');if(box){box.style.display='block';box.innerHTML='<div>MX: '+(d.hasMx?'\u2705 Active ('+escHtml(d.mxHost)+')':'\u274C None')+'</div>'+(d.leads||[]).map(function(l){return'<div style="margin-top:4px">'+escHtml(l.email)+' <button class="btn btn-ghost" style="padding:2px 6px;font-size:9px" data-email="'+escAttr(l.email)+'" data-company="'+escAttr(l.company)+'" onclick="appendLead(this.dataset.email,this.dataset.company)">+ Add</button></div>'}).join('');}if(btn)btn.disabled=false}catch(e){var btn2=document.getElementById('lead-find-btn');if(btn2)btn2.disabled=false;}}
 async function appendLead(email,company){try{await fetch('/api/leads/append',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({leads:[{email:email,company:company}]})});showToast('Added '+email,'success')}catch(e){}}
 
-// ── Analytics ──
-async function loadAnalytics(){try{var d=await(await fetch('/api/analytics')).json();setTxt('a-total-log',d.totalInLog);setTxt('a-success-rate',d.successRate+'%');setTxt('a-eta',fmt(d.etaSeconds));setTxt('a-remaining',d.remaining);
-var responseRate=0;if(allJobs.length>0){var replied=allJobs.filter(function(j){return j.status==='replied'||j.status==='interview'||j.status==='offer'}).length;responseRate=Math.round(replied/allJobs.length*100)}
-setTxt('a-response-rate',responseRate+'%');
-if(chartjsReady){if(charts.donut)charts.donut.destroy();var ctx1=document.getElementById('chart-donut');if(ctx1)charts.donut=new Chart(ctx1,{type:'doughnut',data:{labels:['Sent','Failed','Skipped'],datasets:[{data:[parseInt(document.getElementById('ss').textContent)||0,parseInt(document.getElementById('sf').textContent)||0,parseInt(document.getElementById('sk').textContent)||0],backgroundColor:['#34d399','#f87171','#fbbf24'],borderWidth:0,borderRadius:4}]},options:{responsive:true,cutout:'70%',plugins:{legend:{position:'bottom',labels:{color:'#94a3b8',font:{size:11,family:'Inter'}}}}}});
-if(charts.bar)charts.bar.destroy();var ctx2=document.getElementById('chart-bar');if(ctx2)charts.bar=new Chart(ctx2,{type:'bar',data:{labels:d.labels,datasets:[{label:'Emails Sent',data:d.values,backgroundColor:'rgba(129,140,248,0.5)',borderColor:'#818cf8',borderWidth:1,borderRadius:6}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#64748b',font:{size:9}},grid:{display:false}},y:{ticks:{color:'#64748b',font:{size:10}},grid:{color:'rgba(255,255,255,0.04)'}}}}})}}catch(e){}}
-async function loadAnalyticsExtra(){try{
-var[weekly,status,domains,streak,goals]=await Promise.all([fetch('/api/analytics/weekly').then(function(r){return r.json()}),fetch('/api/analytics/status').then(function(r){return r.json()}),fetch('/api/analytics/domains').then(function(r){return r.json()}),fetch('/api/analytics/streak').then(function(r){return r.json()}).catch(function(){return{currentStreak:0}}),fetch('/api/goals').then(function(r){return r.json()}).catch(function(){return{weekly:200,monthly:800,sentThisWeek:0,sentThisMonth:0,weeklyPct:0,monthlyPct:0}})]);
-setTxt('streak-num',streak.currentStreak||0);
-// Goals
-var gr=document.getElementById('goal-rings');if(gr){gr.innerHTML=renderGoalRing('Weekly',goals.sentThisWeek||0,goals.weekly||200,goals.weeklyPct||0,'var(--accent)')+renderGoalRing('Monthly',goals.sentThisMonth||0,goals.monthly||800,goals.monthlyPct||0,'var(--green)')}
-// Status funnel
-setTxt('fn2-sent',status.sent||0);setTxt('fn2-viewed',status.viewed||0);setTxt('fn2-interview',status.interview||0);setTxt('fn2-offer',status.offer||0);
-var total=Object.values(status).reduce(function(a,b){return a+b},0);var responded=(status.interview||0)+(status.offer||0);setTxt('fn2-rate',total>0?Math.round(responded/total*100)+'%':'0%');
-// Weekly chart
-if(chartjsReady){if(charts.weekly)charts.weekly.destroy();var ctx=document.getElementById('chart-weekly');if(ctx)charts.weekly=new Chart(ctx,{type:'line',data:{labels:weekly.labels,datasets:[{label:'This Week',data:weekly.thisWeek,borderColor:'#818cf8',backgroundColor:'rgba(129,140,248,0.1)',fill:true,tension:.4,pointRadius:3},{label:'Last Week',data:weekly.lastWeek,borderColor:'#64748b',borderDash:[4,4],fill:false,tension:.4,pointRadius:2}]},options:{responsive:true,plugins:{legend:{labels:{color:'#94a3b8',font:{size:10}}}},scales:{x:{ticks:{color:'#64748b',font:{size:9}},grid:{display:false}},y:{ticks:{color:'#64748b'},grid:{color:'rgba(255,255,255,0.03)'}}}}});
-// Status pie
-if(charts.statusPie)charts.statusPie.destroy();var ctx2=document.getElementById('chart-status-pie');if(ctx2)charts.statusPie=new Chart(ctx2,{type:'doughnut',data:{labels:['Sent','Viewed','Interview','Rejected','Offer'],datasets:[{data:[status.sent,status.viewed,status.interview,status.rejected,status.offer],backgroundColor:['#64748b','#60a5fa','#fbbf24','#f87171','#34d399'],borderWidth:0,borderRadius:3}]},options:{responsive:true,cutout:'65%',plugins:{legend:{position:'bottom',labels:{color:'#94a3b8',font:{size:10}}}}}})}
-// Domains
-var dl=document.getElementById('domain-list');if(dl&&domains.domains){var maxCount=Math.max.apply(null,domains.domains.map(function(d){return d.count}))||1;dl.innerHTML=domains.domains.map(function(d){return'<div class="domain-row"><span class="domain-name">'+escHtml(d.domain)+'</span><div class="domain-bar" style="width:'+Math.round(d.count/maxCount*100)+'%"></div><span class="domain-count">'+d.count+'</span></div>'}).join('')}
-// Heatmap
-try{var hd=await(await fetch('/api/analytics/hourly')).json();var hm=document.getElementById('hourly-heatmap');var hl=document.getElementById('hourly-labels');if(hm&&hd.hourly){var maxH=Math.max.apply(null,hd.hourly)||1;hm.innerHTML=hd.hourly.map(function(v,i){var pct=Math.max(4,Math.round(v/maxH*100));var opacity=v>0?0.3+v/maxH*0.7:0.08;return'<div style="flex:1;height:'+pct+'%;background:var(--accent);opacity:'+opacity.toFixed(2)+';border-radius:3px 3px 0 0;min-width:8px" title="'+i+':00 - '+v+' emails"></div>'}).join('');if(hl)hl.innerHTML=hd.hourly.map(function(v,i){return'<div style="flex:1;text-align:center;font-size:8px;color:var(--text-dim)">'+(i%3===0?i:'')+'</div>'}).join('')}}catch(e){}
-}catch(e){}}
+// ── Analytics (Optimized Zero-Lag Bundle Architecture) ──
+var _lastAnalyticsBundle = null;
+
+async function loadAnalytics() {
+  try {
+    var res = await fetch('/api/analytics/bundle');
+    var bundle = await res.json();
+    if (bundle && bundle.ok) {
+      _lastAnalyticsBundle = bundle;
+      applyAnalyticsBundle(bundle);
+      return;
+    }
+  } catch (e) {
+    console.warn('Analytics bundle load failed, attempting fallback...', e);
+  }
+  // Graceful fallback to legacy endpoints if bundle failed
+  await loadAnalyticsLegacy();
+}
+
+async function loadAnalyticsExtra() {
+  // Retained for backwards compatibility: simply reload full analytics bundle
+  if (!_lastAnalyticsBundle) return loadAnalytics();
+}
+
+function applyAnalyticsBundle(b) {
+  if (!b) return;
+  var d = b.analytics || {};
+  setTxt('a-total-log', d.totalInLog !== undefined ? d.totalInLog : 0);
+  setTxt('a-success-rate', (d.successRate !== undefined ? d.successRate : 0) + '%');
+  setTxt('a-eta', fmt(d.etaSeconds));
+  setTxt('a-remaining', d.remaining !== undefined ? d.remaining : 0);
+
+  var responseRate = 0;
+  if (window.allJobs && window.allJobs.length > 0) {
+    var replied = window.allJobs.filter(function(j) {
+      return j.status === 'replied' || j.status === 'interview' || j.status === 'offer';
+    }).length;
+    responseRate = Math.round(replied / window.allJobs.length * 100);
+  }
+  setTxt('a-response-rate', responseRate + '%');
+
+  // Streak & Goals
+  if (b.streak) setTxt('streak-num', b.streak.currentStreak || 0);
+  if (b.goals) {
+    var gr = document.getElementById('goal-rings');
+    if (gr) {
+      gr.innerHTML = renderGoalRing('Weekly', b.goals.sentThisWeek || 0, b.goals.weekly || 200, b.goals.weeklyPct || 0, 'var(--accent)') +
+                     renderGoalRing('Monthly', b.goals.sentThisMonth || 0, b.goals.monthly || 800, b.goals.monthlyPct || 0, 'var(--green)');
+    }
+  }
+
+  // Status Funnel
+  if (b.status) {
+    var st = b.status;
+    setTxt('fn2-sent', st.sent || 0);
+    setTxt('fn2-viewed', st.viewed || 0);
+    setTxt('fn2-interview', st.interview || 0);
+    setTxt('fn2-offer', st.offer || 0);
+    var total = Object.values(st).reduce(function(acc, val) { return acc + (typeof val === 'number' ? val : 0); }, 0);
+    var responded = (st.interview || 0) + (st.offer || 0);
+    setTxt('fn2-rate', total > 0 ? Math.round(responded / total * 100) + '%' : '0%');
+  }
+
+  // Charts
+  if (window.chartjsReady) {
+    // 1. Donut Chart
+    var ssVal = parseInt(document.getElementById('ss')?.textContent) || (b.status?.sent || 0);
+    var sfVal = parseInt(document.getElementById('sf')?.textContent) || 0;
+    var skVal = parseInt(document.getElementById('sk')?.textContent) || 0;
+    var donutData = [ssVal, sfVal, skVal];
+    var ctx1 = document.getElementById('chart-donut');
+    if (ctx1) {
+      if (charts.donut) {
+        charts.donut.data.datasets[0].data = donutData;
+        charts.donut.update('none');
+      } else {
+        charts.donut = new Chart(ctx1, {
+          type: 'doughnut',
+          data: {
+            labels: ['Sent', 'Failed', 'Skipped'],
+            datasets: [{
+              data: donutData,
+              backgroundColor: ['#34d399', '#f87171', '#fbbf24'],
+              borderWidth: 0,
+              borderRadius: 4
+            }]
+          },
+          options: {
+            responsive: true,
+            cutout: '70%',
+            plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8', font: { size: 11, family: 'Inter' } } } }
+          }
+        });
+      }
+    }
+
+    // 2. Bar Chart
+    var ctx2 = document.getElementById('chart-bar');
+    if (ctx2 && d.labels && d.values) {
+      if (charts.bar) {
+        charts.bar.data.labels = d.labels;
+        charts.bar.data.datasets[0].data = d.values;
+        charts.bar.update('none');
+      } else {
+        charts.bar = new Chart(ctx2, {
+          type: 'bar',
+          data: {
+            labels: d.labels,
+            datasets: [{
+              label: 'Emails Sent',
+              data: d.values,
+              backgroundColor: 'rgba(129,140,248,0.5)',
+              borderColor: '#818cf8',
+              borderWidth: 1,
+              borderRadius: 6
+            }]
+          },
+          options: {
+            responsive: true,
+            plugins: { legend: { display: false } },
+            scales: {
+              x: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { display: false } },
+              y: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } }
+            }
+          }
+        });
+      }
+    }
+
+    // 3. Weekly Chart
+    if (b.weekly) {
+      var ctxWeekly = document.getElementById('chart-weekly');
+      if (ctxWeekly) {
+        if (charts.weekly) {
+          charts.weekly.data.labels = b.weekly.labels;
+          charts.weekly.data.datasets[0].data = b.weekly.thisWeek;
+          charts.weekly.data.datasets[1].data = b.weekly.lastWeek;
+          charts.weekly.update('none');
+        } else {
+          charts.weekly = new Chart(ctxWeekly, {
+            type: 'line',
+            data: {
+              labels: b.weekly.labels,
+              datasets: [
+                { label: 'This Week', data: b.weekly.thisWeek, borderColor: '#818cf8', backgroundColor: 'rgba(129,140,248,0.1)', fill: true, tension: .4, pointRadius: 3 },
+                { label: 'Last Week', data: b.weekly.lastWeek, borderColor: '#64748b', borderDash: [4, 4], fill: false, tension: .4, pointRadius: 2 }
+              ]
+            },
+            options: {
+              responsive: true,
+              plugins: { legend: { labels: { color: '#94a3b8', font: { size: 10 } } } },
+              scales: {
+                x: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { display: false } },
+                y: { ticks: { color: '#64748b' }, grid: { color: 'rgba(255,255,255,0.03)' } }
+              }
+            }
+          });
+        }
+      }
+    }
+
+    // 4. Status Pie
+    if (b.status) {
+      var ctxPie = document.getElementById('chart-status-pie');
+      if (ctxPie) {
+        var pieData = [b.status.sent || 0, b.status.viewed || 0, b.status.interview || 0, b.status.rejected || 0, b.status.offer || 0];
+        if (charts.statusPie) {
+          charts.statusPie.data.datasets[0].data = pieData;
+          charts.statusPie.update('none');
+        } else {
+          charts.statusPie = new Chart(ctxPie, {
+            type: 'doughnut',
+            data: {
+              labels: ['Sent', 'Viewed', 'Interview', 'Rejected', 'Offer'],
+              datasets: [{
+                data: pieData,
+                backgroundColor: ['#64748b', '#60a5fa', '#fbbf24', '#f87171', '#34d399'],
+                borderWidth: 0,
+                borderRadius: 3
+              }]
+            },
+            options: {
+              responsive: true,
+              cutout: '65%',
+              plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8', font: { size: 10 } } } }
+            }
+          });
+        }
+      }
+    }
+
+    // 5. Cumulative Chart
+    if (b.cumulative && b.cumulative.data) {
+      setTxt('cumulative-total-badge', (b.cumulative.totalEver || 0) + ' sent ever');
+      var ctxCum = document.getElementById('chart-cumulative');
+      if (ctxCum && b.cumulative.data.length > 0) {
+        var cumLabels = b.cumulative.data.map(function(x) { return x.date; });
+        var cumVals = b.cumulative.data.map(function(x) { return x.cumulative; });
+        if (charts.cumulative) {
+          charts.cumulative.data.labels = cumLabels;
+          charts.cumulative.data.datasets[0].data = cumVals;
+          charts.cumulative.update('none');
+        } else {
+          charts.cumulative = new Chart(ctxCum, {
+            type: 'line',
+            data: {
+              labels: cumLabels,
+              datasets: [{
+                label: 'Cumulative Sent',
+                data: cumVals,
+                borderColor: '#818cf8',
+                backgroundColor: 'rgba(129,140,248,0.15)',
+                fill: true,
+                tension: 0.3,
+                pointRadius: 3,
+                pointBackgroundColor: '#818cf8'
+              }]
+            },
+            options: {
+              responsive: true,
+              plugins: { legend: { display: false } },
+              scales: {
+                x: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { display: false } },
+                y: { ticks: { color: '#64748b' }, grid: { color: 'rgba(255,255,255,0.03)' } }
+              }
+            }
+          });
+        }
+      }
+    }
+  }
+
+  // Top Domains
+  if (b.domains && b.domains.domains) {
+    var dl = document.getElementById('domain-list');
+    if (dl) {
+      var maxCount = Math.max.apply(null, b.domains.domains.map(function(dm) { return dm.count; })) || 1;
+      dl.innerHTML = b.domains.domains.map(function(dm) {
+        return '<div class="domain-row"><span class="domain-name">' + escHtml(dm.domain) + '</span><div class="domain-bar" style="width:' + Math.round(dm.count / maxCount * 100) + '%"></div><span class="domain-count">' + dm.count + '</span></div>';
+      }).join('');
+    }
+  }
+
+  // Hourly Heatmap (Mini)
+  if (b.hourly && b.hourly.hourly) {
+    var hm = document.getElementById('hourly-heatmap');
+    var hl = document.getElementById('hourly-labels');
+    if (hm) {
+      var maxH = Math.max.apply(null, b.hourly.hourly) || 1;
+      hm.innerHTML = b.hourly.hourly.map(function(v, i) {
+        var pct = Math.max(4, Math.round(v / maxH * 100));
+        var opacity = v > 0 ? 0.3 + v / maxH * 0.7 : 0.08;
+        return '<div style="flex:1;height:' + pct + '%;background:var(--accent);opacity:' + opacity.toFixed(2) + ';border-radius:3px 3px 0 0;min-width:8px" title="' + i + ':00 - ' + v + ' emails"></div>';
+      }).join('');
+      if (hl) {
+        hl.innerHTML = b.hourly.hourly.map(function(v, i) {
+          return '<div style="flex:1;text-align:center;font-size:8px;color:var(--text-dim)">' + (i % 3 === 0 ? i : '') + '</div>';
+        }).join('');
+      }
+    }
+  }
+
+  // A/B Test
+  if (b.abTest) {
+    var ab = b.abTest;
+    setTxt('ab-a-rate', (ab.A?.openRate || 0) + '%');
+    setTxt('ab-a-opened', ab.A?.opened || 0);
+    setTxt('ab-a-sent', ab.A?.sent || 0);
+    setTxt('ab-b-rate', (ab.B?.openRate || 0) + '%');
+    setTxt('ab-b-opened', ab.B?.opened || 0);
+    setTxt('ab-b-sent', ab.B?.sent || 0);
+    var badge = document.getElementById('ab-winner-badge');
+    var conf = document.getElementById('ab-confidence-text');
+    if (ab.winner === 'A') {
+      if (badge) { badge.textContent = '🏆 Variant A Leading'; badge.style.color = 'var(--accent)'; }
+      if (conf) conf.textContent = 'Variant A leads with ' + ab.A.openRate + '% open rate (' + ((ab.A.openRate || 0) - (ab.B.openRate || 0)) + '% edge)';
+    } else if (ab.winner === 'B') {
+      if (badge) { badge.textContent = '🏆 Variant B Leading'; badge.style.color = 'var(--accent2)'; }
+      if (conf) conf.textContent = 'Variant B leads with ' + ab.B.openRate + '% open rate (' + ((ab.B.openRate || 0) - (ab.A.openRate || 0)) + '% edge)';
+    } else {
+      if (badge) { badge.textContent = 'Active Test'; badge.style.color = 'var(--text-dim)'; }
+      if (conf) conf.textContent = 'Send emails to generate A/B split comparisons';
+    }
+  }
+
+  // Send-Time Intelligence
+  if (b.optimalHours) {
+    var optBadge = document.getElementById('opt-hours-badge');
+    if (optBadge) optBadge.textContent = b.optimalHours.recommendation || 'Analyzing historical send data...';
+    var topEl = document.getElementById('opt-top-hours');
+    if (topEl && b.optimalHours.bestHours && b.optimalHours.bestHours.length > 0) {
+      topEl.innerHTML = b.optimalHours.bestHours.map(function(h) {
+        var hStr = (h.hour < 10 ? '0' : '') + h.hour + ':00';
+        return '<span class="best-time-badge">⚡ ' + hStr + ' — ' + h.replyRate + '% replies (' + h.sent + ' sent)</span>';
+      }).join('');
+    }
+  }
+
+  // Smart Blacklist
+  if (b.blacklist) {
+    var blEl = document.getElementById('bl-list');
+    if (blEl) {
+      if (!b.blacklist.domains || b.blacklist.domains.length === 0) {
+        blEl.innerHTML = '<div style="font-size:11px;color:var(--text-dim);text-align:center;padding:16px">✅ Clean deliverability! No blacklisted domains</div>';
+      } else {
+        blEl.innerHTML = b.blacklist.domains.map(function(dm) {
+          return '<div class="bl-domain">' +
+            '<span class="bl-domain-name">' + escHtml(dm.domain) + '</span>' +
+            '<span class="bl-rate">' + dm.failRate + '% fail</span>' +
+            '<button class="btn btn-ghost" style="padding:2px 6px;font-size:9px" data-dom="' + escAttr(dm.domain) + '" onclick="removeBlacklistDomain(this.dataset.dom)">Unblock</button>' +
+          '</div>';
+        }).join('');
+      }
+    }
+  }
+
+  // Company Engagement
+  if (b.companies) {
+    window._companiesCache = b.companies.companies || [];
+    renderCompanyAnalyticsTable(window._companiesCache);
+  }
+
+  // 24-Hour Recruiter Open Activity Heatmap
+  if (b.hourlyHeatmap && b.hourlyHeatmap.ok) {
+    var hmData = b.hourlyHeatmap;
+    var pkBadge = document.getElementById('heatmap-peak-badge');
+    if (pkBadge) pkBadge.textContent = hmData.peakPct + '% Sent in Prime HR Window';
+    var hmContainer = document.getElementById('hourly-heatmap-bars');
+    var hmLblContainer = document.getElementById('hourly-heatmap-labels');
+    if (hmContainer && hmData.hourly) {
+      var maxCountHeat = Math.max(1, Math.max.apply(null, hmData.hourly.map(function(h) { return h.count; })));
+      hmContainer.innerHTML = hmData.hourly.map(function(h) {
+        var pct = Math.max(8, Math.round((h.count / maxCountHeat) * 100));
+        var bg = h.isPeak ? 'linear-gradient(180deg,#34d399,#059669)' : 'linear-gradient(180deg,#6366f1,#4338ca)';
+        var title = h.label + ': ' + h.count + ' sent' + (h.isPeak ? ' (Prime Window)' : '');
+        return '<div style="height:100%;display:flex;align-items:flex-end" title="' + escAttr(title) + '">' +
+          '<div style="width:100%;height:' + pct + '%;background:' + bg + ';border-radius:3px 3px 0 0;opacity:' + (h.count > 0 ? '1' : '0.25') + ';transition:all .3s"></div>' +
+        '</div>';
+      }).join('');
+      if (hmLblContainer) {
+        hmLblContainer.innerHTML = hmData.hourly.map(function(h) {
+          return '<div style="color:' + (h.isPeak ? 'var(--green);font-weight:700' : 'var(--text-dim)') + '">' + h.hour + '</div>';
+        }).join('');
+      }
+    }
+  }
+}
+
+async function loadAnalyticsLegacy() {
+  try {
+    var d = await (await fetch('/api/analytics')).json();
+    setTxt('a-total-log', d.totalInLog);
+    setTxt('a-success-rate', d.successRate + '%');
+    setTxt('a-eta', fmt(d.etaSeconds));
+    setTxt('a-remaining', d.remaining);
+  } catch (e) {}
+}
 function renderGoalRing(label,current,target,pct,color){var r=36,c=2*Math.PI*r,offset=c-(pct/100*c);return'<div class="goal-ring"><svg width="90" height="90" viewBox="0 0 90 90"><circle cx="45" cy="45" r="'+r+'" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="6"/><circle cx="45" cy="45" r="'+r+'" fill="none" stroke="'+color+'" stroke-width="6" stroke-dasharray="'+c+'" stroke-dashoffset="'+offset+'" stroke-linecap="round" style="transition:stroke-dashoffset .6s ease"/><text x="45" y="42" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="900" font-family="Inter">'+pct+'%</text><text x="45" y="56" text-anchor="middle" fill="var(--text-dim)" font-size="9" font-weight="600" font-family="Inter">'+current+'/'+target+'</text></svg><div class="ring-label">'+label+'</div></div>'}
 async function loadFunnelStats(){try{var d=await(await fetch('/api/funnel/stats')).json();setTxt('fn-sent',d.totalSent);setTxt('fn-opened',d.totalOpened);setTxt('fn-resume',d.totalResumeClicked);setTxt('fn-replied',d.totalReplied);setTxt('fn-interviews',d.totalInterviews);setTxt('fn-open-rate',d.openRate+'%');setTxt('fn-click-rate',d.clickRate+'%');setTxt('fn-reply-rate',d.replyRate+'%');if(typeof renderSvgFunnel==='function')renderSvgFunnel(d.totalSent||0,d.totalOpened||0,d.totalReplied||0,d.totalInterviews||0,0)}catch(e){}}
 
@@ -8501,6 +9723,158 @@ async function removeSuppressionUI(target, type){
     showToast('❌ Error: ' + e.message, 'error');
   }
 }
+
+// ══════════ EMAIL SAFETY & BLOCKED DOMAINS CLIENT LOGIC ══════════
+
+async function loadBlockedDomainsUI(){
+  try {
+    var res = await fetch('/api/safety/blocked-domains');
+    var d = await res.json();
+    if(!d.ok) return;
+
+    var personal = d.personalDomains || [];
+    var disposable = d.disposableDomains || [];
+    var custom = d.customBlockedDomains || [];
+
+    setTxt('blocked-personal-count', personal.length);
+    setTxt('blocked-disposable-count', disposable.length);
+    setTxt('blocked-custom-count', custom.length);
+
+    var pList = document.getElementById('blocked-personal-list');
+    if(pList){
+      pList.innerHTML = personal.map(function(dm){
+        return '<span class="badge" style="background:rgba(234,179,8,0.12);color:#fbbf24;font-size:10px;padding:2px 6px;border:1px solid rgba(234,179,8,0.2)">@' + escHtml(dm) + '</span>';
+      }).join('');
+    }
+
+    var dispList = document.getElementById('blocked-disposable-list');
+    if(dispList){
+      dispList.innerHTML = disposable.map(function(dm){
+        return '<span class="badge" style="background:rgba(239,68,68,0.12);color:#f87171;font-size:10px;padding:2px 6px;border:1px solid rgba(239,68,68,0.2)">@' + escHtml(dm) + '</span>';
+      }).join('');
+    }
+
+    var cList = document.getElementById('blocked-custom-list');
+    if(cList){
+      if(!custom.length){
+        cList.innerHTML = '<div style="font-size:11px;color:var(--text-dim);padding:8px;text-align:center">No custom blocked domains</div>';
+      } else {
+        cList.innerHTML = custom.map(function(dm){
+          return '<div style="display:flex;justify-content:space-between;align-items:center;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:11px">' +
+            '<span style="font-weight:600;color:var(--text-bright)">@' + escHtml(dm) + '</span>' +
+            '<button class="btn btn-ghost" style="padding:2px 6px;font-size:10px;color:var(--red)" data-domain="' + escAttr(dm) + '" onclick="removeCustomBlockedDomainUI(this.dataset.domain)">✕ Remove</button>' +
+          '</div>';
+        }).join('');
+      }
+    }
+  } catch(e){
+    console.error('Error loading blocked domains:', e);
+  }
+}
+
+async function addCustomBlockedDomainUI(){
+  try {
+    var inp = document.getElementById('custom-block-domain');
+    var domain = inp ? inp.value.trim().toLowerCase() : '';
+    if(!domain){
+      showToast('⚠️ Please enter a domain to block (e.g. competitor.com)', 'warn');
+      return;
+    }
+    var res = await fetch('/api/safety/blocked-domains', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ domain: domain, category: 'custom' })
+    });
+    var d = await res.json();
+    if(d.ok){
+      showToast('🚫 Domain ' + domain + ' added to custom blocklist', 'success');
+      if(inp) inp.value = '';
+      loadBlockedDomainsUI();
+    } else {
+      showToast('❌ Failed: ' + (d.error || 'Unknown error'), 'error');
+    }
+  } catch(e){
+    showToast('❌ Error: ' + e.message, 'error');
+  }
+}
+
+async function removeCustomBlockedDomainUI(domain){
+  try {
+    var res = await fetch('/api/safety/blocked-domains', {
+      method: 'DELETE',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ domain: domain, category: 'custom' })
+    });
+    var d = await res.json();
+    if(d.ok){
+      showToast('✓ Domain ' + domain + ' removed from blocklist', 'info');
+      loadBlockedDomainsUI();
+    } else {
+      showToast('❌ Failed: ' + (d.error || 'Unknown error'), 'error');
+    }
+  } catch(e){
+    showToast('❌ Error: ' + e.message, 'error');
+  }
+}
+
+async function testEmailSafetyUI(){
+  var inp = document.getElementById('safety-test-email');
+  var resBox = document.getElementById('safety-test-result');
+  var email = inp ? inp.value.trim() : '';
+  if(!email){
+    showToast('⚠️ Please enter an email address to audit', 'warn');
+    return;
+  }
+  if(resBox){
+    resBox.style.display = 'block';
+    resBox.style.background = 'rgba(56,189,248,0.1)';
+    resBox.style.border = '1px solid rgba(56,189,248,0.3)';
+    resBox.style.color = 'var(--text-bright)';
+    resBox.innerHTML = '⏳ Auditing recipient through 13-stage safety engine...';
+  }
+  try {
+    var res = await fetch('/api/safety/check', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ email: email })
+    });
+    var d = await res.json();
+    if(!d.ok){
+      if(resBox){
+        resBox.style.background = 'rgba(239,68,68,0.15)';
+        resBox.style.border = '1px solid rgba(239,68,68,0.3)';
+        resBox.innerHTML = '❌ Audit failed: ' + escHtml(d.error || 'Unknown error');
+      }
+      return;
+    }
+    var rep = d.report || {};
+    var isSafe = rep.isEligible;
+    if(resBox){
+      resBox.style.display = 'block';
+      if(isSafe){
+        resBox.style.background = 'rgba(16,185,129,0.15)';
+        resBox.style.border = '1px solid rgba(16,185,129,0.4)';
+        resBox.innerHTML = '<div style="font-weight:800;color:#34d399;margin-bottom:4px">✅ RECIPIENT ELIGIBLE FOR OUTREACH</div>' +
+          '<div><strong style="color:var(--text-bright)">Normalized:</strong> ' + escHtml(rep.normalizedEmail || email) + ' &bull; <strong style="color:var(--text-bright)">Verdict:</strong> ' + escHtml(rep.verdict || 'ALLOWED') + '</div>' +
+          '<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Passed syntax, RFC check, domain reputation, suppression filters, and cooldown lock checks.</div>';
+      } else {
+        resBox.style.background = 'rgba(239,68,68,0.15)';
+        resBox.style.border = '1px solid rgba(239,68,68,0.4)';
+        resBox.innerHTML = '<div style="font-weight:800;color:#f87171;margin-bottom:4px">🚫 RECIPIENT BLOCKED FROM OUTREACH</div>' +
+          '<div><strong style="color:var(--text-bright)">Reason:</strong> <span style="color:#fca5a5">' + escHtml(rep.reason || rep.verdict || 'Blocked') + '</span></div>' +
+          '<div><strong style="color:var(--text-bright)">Verdict Code:</strong> <code>' + escHtml(rep.verdict || 'UNKNOWN') + '</code>' +
+          (rep.cooldownUntil ? ' &bull; <strong style="color:var(--yellow)">Cooldown Until:</strong> ' + escHtml(new Date(rep.cooldownUntil).toLocaleString()) : '') + '</div>';
+      }
+    }
+  } catch(e){
+    if(resBox){
+      resBox.style.background = 'rgba(239,68,68,0.15)';
+      resBox.style.border = '1px solid rgba(239,68,68,0.3)';
+      resBox.innerHTML = '❌ Network error during safety check: ' + escHtml(e.message);
+    }
+  }
+}
+
 // ══════════ QUICK CAMPAIGN PASTE & COOLDOWN CLIENT LOGIC ══════════
 
 async function quickCampaignPreview(){
@@ -8902,7 +10276,9 @@ async function triggerEmergencyStop(){
       setTimeout(function(){ switchTab(initial); }, 150);
     }
   } catch(e) {}
+  setTimeout(init3DTiltEngine, 250);
 })();
+document.addEventListener('DOMContentLoaded', function(){ setTimeout(init3DTiltEngine, 250); });
 
 // ═══════════════ ENHANCED WORKABLE JOBS SYSTEM (Section 13 & 14) ═══════════════
 window.__jobsList = [];

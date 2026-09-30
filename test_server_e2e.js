@@ -91,7 +91,9 @@ async function run() {
     assert.ok(htmlRes.body.includes("loadCandidateProfileUI"), "Missing loadCandidateProfileUI in HTML");
     assert.ok(htmlRes.body.includes("simulateJobMatchUI"), "Missing simulateJobMatchUI in HTML");
     assert.ok(htmlRes.body.includes("loadRecruitersUI"), "Missing loadRecruitersUI in HTML");
-    console.log("  ✅ Dashboard contains all 3 new panels and client scripts");
+    assert.ok(htmlRes.body.includes("loadBlockedDomainsUI"), "Missing loadBlockedDomainsUI in HTML");
+    assert.ok(htmlRes.body.includes("testEmailSafetyUI"), "Missing testEmailSafetyUI in HTML");
+    console.log("  ✅ Dashboard contains all 3 new panels and safety engine UI client scripts");
     passed++;
 
     // 2. Candidate Profile API
@@ -345,6 +347,76 @@ async function run() {
     assert.strictEqual(restoreRes.status, 200);
     assert.strictEqual(restoreRes.body.allowGmail, initialAllow);
     console.log("  ✅ @gmail.com sending mode toggles smoothly and synchronizes with state");
+    passed++;
+
+    // 18. Central Safety Engine Check API (Section 4 & 5)
+    console.log("Test 18: Email Safety Engine Check API (Single & Batch)");
+    const singleSafety = await request(
+      { path: "/api/safety/check", method: "POST" },
+      { email: "hr@yahoo.com" }
+    );
+    assert.strictEqual(singleSafety.status, 200);
+    assert.strictEqual(singleSafety.body.ok, true);
+    assert.strictEqual(singleSafety.body.verdict.eligible, false);
+    assert.strictEqual(singleSafety.body.verdict.status, "BLOCKED_PERSONAL_DOMAIN");
+
+    const corpSafety = await request(
+      { path: "/api/safety/check", method: "POST" },
+      { email: "hr@intel.com", company: "Intel" }
+    );
+    assert.strictEqual(corpSafety.status, 200);
+    assert.strictEqual(corpSafety.body.verdict.eligible, true);
+    assert.strictEqual(corpSafety.body.verdict.status, "ELIGIBLE");
+
+    const batchSafety = await request(
+      { path: "/api/safety/check", method: "POST" },
+      {
+        emails: [
+          "careers@company.com, Company One",
+          "recruiter@gmail.com, Personal One",
+          "careers@company.com, Company One",
+          "disposable@mailinator.com",
+        ]
+      }
+    );
+    assert.strictEqual(batchSafety.status, 200);
+    assert.strictEqual(batchSafety.body.report.uniqueCount, 3);
+    assert.strictEqual(batchSafety.body.report.duplicateInBatchCount, 1);
+    assert.strictEqual(batchSafety.body.report.personalBlockedCount, 1);
+    assert.strictEqual(batchSafety.body.report.disposableBlockedCount, 1);
+    assert.strictEqual(batchSafety.body.report.eligibleCount, 1);
+    console.log("  ✅ /api/safety/check verified single verdict and batch quality report");
+    passed++;
+
+    // 19. Blocked Domains Management API (Section 5)
+    console.log("Test 19: Blocked Domains CRUD & Safety Telemetry API");
+    const getBlocked = await request({ path: "/api/safety/blocked-domains", method: "GET" });
+    assert.strictEqual(getBlocked.status, 200);
+    assert.ok(Array.isArray(getBlocked.body.blockedDomains.personal));
+    assert.ok(getBlocked.body.blockedDomains.personal.includes("gmail.com"));
+
+    // Add custom blocked domain
+    const addBlocked = await request(
+      { path: "/api/safety/blocked-domains", method: "POST" },
+      { domain: "competitor-spam.com", type: "custom" }
+    );
+    assert.strictEqual(addBlocked.status, 200);
+    assert.ok(addBlocked.body.blockedDomains.customBlocked.includes("competitor-spam.com"));
+
+    // Remove custom blocked domain
+    const delBlocked = await request(
+      { path: "/api/safety/blocked-domains", method: "DELETE" },
+      { domain: "competitor-spam.com", type: "custom" }
+    );
+    assert.strictEqual(delBlocked.status, 200);
+    assert.ok(!delBlocked.body.blockedDomains.customBlocked.includes("competitor-spam.com"));
+
+    // Safety stats
+    const statsRes = await request({ path: "/api/safety/stats", method: "GET" });
+    assert.strictEqual(statsRes.status, 200);
+    assert.ok(typeof statsRes.body.stats.activeSendLocks === "number");
+    assert.ok(typeof statsRes.body.stats.personalDomainsBlockedCount === "number");
+    console.log("  ✅ Blocked domains management and safety telemetry verified");
     passed++;
 
     console.log(`\n🎉 ALL ${passed}/${passed} SERVER INTEGRATION TESTS PASSED!`);

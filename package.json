@@ -7,8 +7,8 @@
     "start": "node send_emails.js",
     "dev": "nodemon send_emails.js",
     "watch": "nodemon send_emails.js",
-    "build": "node --check send_emails.js && node test_engine.js && node test_server_e2e.js",
-    "test": "node test_engine.js && node test_server_e2e.js",
+    "build": "node --check send_emails.js && node test_safety_engine.js && node test_engine.js && node test_server_e2e.js",
+    "test": "node test_safety_engine.js && node test_engine.js && node test_server_e2e.js",
     "clean": "node clean_emails.js",
     "clean:gmail": "node clean_emails.js --allow-gmail",
     "setup": "if not exist .env copy .env.example .env && echo Created .env file - please edit with your credentials"
