@@ -4875,13 +4875,24 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(1.15)}}
 
 /* ═══ TABS ═══ */
-.tabs{display:flex;gap:3px;background:var(--glass-bg);backdrop-filter:blur(16px);border:1px solid var(--glass-border);border-radius:14px;padding:4px;margin-bottom:22px;overflow-x:auto}
-.tab-btn{padding:9px 16px;border-radius:10px;border:none;background:transparent;color:var(--text-dim);font-family:var(--sans);font-size:12px;font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap;display:flex;align-items:center;gap:5px}
-.tab-btn:hover{color:var(--text);background:rgba(255,255,255,0.03)}
-.tab-btn.active{background:linear-gradient(135deg,rgba(129,140,248,0.15),rgba(167,139,250,0.1));color:var(--text);box-shadow:0 2px 10px rgba(0,0,0,0.3);border:1px solid var(--border)}
+.tabs{display:flex;gap:4px;background:var(--glass-bg);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border:1px solid var(--glass-border);border-radius:14px;padding:5px;margin-bottom:22px;overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none}
+.tabs::-webkit-scrollbar{display:none;width:0;height:0}
+.tab-btn{padding:9px 16px;border-radius:10px;border:none;background:transparent;color:var(--text-dim);font-family:var(--sans);font-size:12px;font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap;display:flex;align-items:center;gap:6px}
+.tab-btn:hover{color:var(--text);background:rgba(255,255,255,0.05);transform:translateY(-1px)}
+.tab-btn.active{background:linear-gradient(135deg,rgba(129,140,248,0.2),rgba(167,139,250,0.12));color:#fff;box-shadow:0 2px 12px rgba(99,102,241,0.25);border:1px solid var(--border)}
 .tab-panel{display:none}
 .tab-panel.active{display:block;animation:fadeSlide .3s cubic-bezier(.16,1,.3,1)}
 @keyframes fadeSlide{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+
+/* ═══ PROGRESS BAR & SPEED GROUP UTILITIES ═══ */
+.p-bar{height:8px;background:rgba(255,255,255,.06);border-radius:99px;overflow:hidden;position:relative}
+.p-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--accent2),var(--green));transition:width .6s cubic-bezier(.34,1.56,.64,1);position:relative;box-shadow:0 0 14px var(--green-glow)}
+.p-fill::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.3),transparent);animation:shimmer 2.5s infinite}
+
+.sp-grp{display:flex;gap:4px;align-items:center;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:24px;padding:3px;flex-wrap:wrap}
+.sp-btn{padding:6px 12px;border-radius:20px;border:none;background:transparent;color:var(--text-dim);font-family:var(--sans);font-size:11px;font-weight:700;cursor:pointer;transition:all .2s;display:inline-flex;align-items:center;gap:4px}
+.sp-btn:hover{color:var(--text);background:rgba(255,255,255,0.06);transform:translateY(-1px)}
+.sp-btn.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;box-shadow:0 2px 10px var(--accent-glow)}
 
 /* ═══ PROGRESS BAR ═══ */
 .prog-card{background:linear-gradient(135deg,rgba(129,140,248,0.08),rgba(167,139,250,0.05));border:1px solid rgba(129,140,248,0.2);border-radius:var(--radius);padding:24px;margin-bottom:16px;backdrop-filter:blur(16px)}
@@ -6529,13 +6540,13 @@ html, body {
 
     <!-- Campaign Metrics Grid -->
     <div class="stats" style="margin-bottom:16px">
-      <div class="stat"><div class="stat-val" id="camp-stat-jobs" style="color:var(--accent)">0</div><div class="stat-lbl">Jobs Tracked</div></div>
-      <div class="stat"><div class="stat-val" id="camp-stat-matched" style="color:var(--blue)">0</div><div class="stat-lbl">Matched</div></div>
-      <div class="stat"><div class="stat-val" id="camp-stat-queued" style="color:var(--yellow)">0</div><div class="stat-lbl">Queued Leads</div></div>
-      <div class="stat"><div class="stat-val" id="camp-stat-sent" style="color:var(--green)">0</div><div class="stat-lbl">Sent Successfully</div></div>
-      <div class="stat"><div class="stat-val" id="camp-stat-failed" style="color:var(--red)">0</div><div class="stat-lbl">Failed / Bounced</div></div>
-      <div class="stat"><div class="stat-val" id="camp-stat-replies" style="color:var(--purple)">0</div><div class="stat-lbl">Recruiter Replies</div></div>
-      <div class="stat"><div class="stat-val" id="camp-stat-interviews" style="color:#fbbf24">0</div><div class="stat-lbl">Interviews Scheduled</div></div>
+      <div class="stat"><div class="stat-icon">💼</div><div class="stat-val" id="camp-stat-jobs" style="color:var(--accent)">0</div><div class="stat-lbl">Jobs Tracked</div></div>
+      <div class="stat"><div class="stat-icon">🎯</div><div class="stat-val" id="camp-stat-matched" style="color:var(--blue)">0</div><div class="stat-lbl">Matched</div></div>
+      <div class="stat"><div class="stat-icon">⏳</div><div class="stat-val" id="camp-stat-queued" style="color:var(--yellow)">0</div><div class="stat-lbl">Queued Leads</div></div>
+      <div class="stat"><div class="stat-icon">🚀</div><div class="stat-val" id="camp-stat-sent" style="color:var(--green)">0</div><div class="stat-lbl">Sent Successfully</div></div>
+      <div class="stat"><div class="stat-icon">⚠️</div><div class="stat-val" id="camp-stat-failed" style="color:var(--red)">0</div><div class="stat-lbl">Failed / Bounced</div></div>
+      <div class="stat"><div class="stat-icon">💬</div><div class="stat-val" id="camp-stat-replies" style="color:var(--purple)">0</div><div class="stat-lbl">Recruiter Replies</div></div>
+      <div class="stat"><div class="stat-icon">📅</div><div class="stat-val" id="camp-stat-interviews" style="color:#fbbf24">0</div><div class="stat-lbl">Interviews Scheduled</div></div>
     </div>
   </div>
 
