@@ -6502,6 +6502,130 @@ html, body {
   transform:translateX(-50%);
   background:linear-gradient(90deg,transparent,rgba(34,211,238,0.2),rgba(129,140,248,0.25),rgba(167,139,250,0.2),transparent);
 }
+/* ═══ COMPACT UI: SMALL ICONS & SPACE-SAVING CHARTS ═══ */
+.icon-sm, .card-title span.icon, .tab-btn span.icon {
+  font-size: 13px !important;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+}
+.tab-btn {
+  padding: 6px 13px !important;
+  font-size: 11px !important;
+  gap: 5px !important;
+}
+.tab-btn .badge {
+  font-size: 8.5px !important;
+  padding: 1px 6px !important;
+}
+.card-title {
+  font-size: 11.5px !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.3px !important;
+  margin-bottom: 8px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+}
+.card {
+  padding: 12px 14px !important;
+  margin-bottom: 10px !important;
+  border-radius: 12px !important;
+}
+.chart-card {
+  padding: 10px 14px !important;
+  border-radius: 12px !important;
+}
+.chart-card h3 {
+  font-size: 11px !important;
+  font-weight: 700 !important;
+  margin-bottom: 6px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 5px !important;
+  color: var(--text-secondary) !important;
+}
+.chart-card canvas {
+  max-height: 125px !important;
+  width: 100% !important;
+}
+#chart-donut, #chart-status-pie {
+  max-height: 120px !important;
+}
+#chart-bar {
+  max-height: 120px !important;
+}
+#chart-cumulative, #chart-weekly {
+  max-height: 80px !important;
+}
+.streak-card {
+  padding: 10px 14px !important;
+  gap: 10px !important;
+  border-radius: 12px !important;
+}
+.streak-fire {
+  font-size: 20px !important;
+}
+.streak-num {
+  font-size: 20px !important;
+}
+.goal-ring-container {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  justify-content: flex-start;
+}
+.goal-ring {
+  text-align: center;
+}
+.goal-ring .ring-label {
+  font-size: 9px !important;
+  color: var(--text-dim);
+  font-weight: 700;
+  margin-top: 2px;
+}
+.funnel-grid {
+  gap: 8px !important;
+}
+.funnel-card {
+  padding: 6px 10px !important;
+  border-radius: 10px !important;
+}
+.f-val {
+  font-size: 17px !important;
+}
+.f-lbl {
+  font-size: 8px !important;
+  letter-spacing: 0.5px !important;
+}
+.analytics-top {
+  gap: 8px !important;
+  margin-bottom: 10px !important;
+}
+.a-metric {
+  padding: 9px 12px !important;
+  border-radius: 10px !important;
+}
+.a-val {
+  font-size: 19px !important;
+}
+.a-lbl {
+  font-size: 8px !important;
+  letter-spacing: 0.5px !important;
+}
+.best-time-badge {
+  font-size: 9.5px !important;
+  padding: 3px 8px !important;
+}
+.bl-domain {
+  padding: 4px 8px !important;
+  font-size: 10.5px !important;
+}
+.company-row {
+  padding: 4px 8px !important;
+  font-size: 10.5px !important;
+}
 </style>
 </head>
 <body>
@@ -6940,20 +7064,20 @@ html, body {
     </div>
 
     <!-- Streak & Goals -->
-    <div style="display:grid;grid-template-columns:auto 1fr;gap:14px;margin-bottom:16px">
+    <div style="display:grid;grid-template-columns:auto 1fr;gap:10px;margin-bottom:10px">
       <div class="streak-card card-3d" id="streak-card">
         <div class="streak-fire">&#x1F525;</div>
-        <div><div class="streak-num" id="streak-num">0</div><div style="font-size:11px;color:var(--text-dim);font-weight:700">DAY STREAK</div></div>
+        <div><div class="streak-num" id="streak-num">0</div><div style="font-size:9.5px;color:var(--text-dim);font-weight:700">DAY STREAK</div></div>
       </div>
-      <div class="card" style="padding:16px">
-        <div class="card-title" style="margin-bottom:10px">&#x1F3AF; Weekly &amp; Monthly Goals</div>
+      <div class="card" style="padding:10px 14px">
+        <div class="card-title" style="margin-bottom:6px">&#x1F3AF; Weekly &amp; Monthly Goals</div>
         <div class="goal-ring-container" id="goal-rings"></div>
       </div>
     </div>
 
     <!-- Conversion Funnel -->
-    <div class="card" style="margin-bottom:14px">
-      <div class="card-title">&#x1F4CA; Application Conversion Funnel</div>
+    <div class="card" style="margin-bottom:10px;padding:10px 14px">
+      <div class="card-title" style="margin-bottom:8px">&#x1F4CA; Application Conversion Funnel</div>
       <div class="funnel-grid perspective-root">
         <div class="funnel-card card-3d"><div class="f-val b" id="fn2-sent">0</div><div class="f-lbl">Sent</div></div>
         <div class="funnel-card card-3d"><div class="f-val y" id="fn2-viewed">0</div><div class="f-lbl">Viewed</div></div>
@@ -6961,130 +7085,136 @@ html, body {
         <div class="funnel-card card-3d"><div class="f-val g" id="fn2-offer">0</div><div class="f-lbl">Offer &#x1F389;</div></div>
         <div class="funnel-card card-3d"><div class="f-val o" id="fn2-rate">0%</div><div class="f-lbl">Response Rate</div></div>
       </div>
-      <div id="svg-funnel" style="margin-top:14px;overflow-x:auto"></div>
+      <div id="svg-funnel" style="margin-top:8px;overflow-x:auto"></div>
     </div>
 
+    <!-- Core Charts: Session Results & Emails Per Day -->
     <div class="charts-grid perspective-root">
-      <div class="chart-card card-3d"><h3>&#x1F31F; Session Results</h3><canvas id="chart-donut" width="260" height="260"></canvas></div>
-      <div class="chart-card card-3d"><h3>&#x1F4C5; Emails Per Day</h3><canvas id="chart-bar" height="200"></canvas></div>
-    </div>
-
-    <!-- ═══ v7.0: CUMULATIVE GROWTH & SEND VELOCITY ═══ -->
-    <div class="card" style="margin-top:14px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-        <div class="card-title" style="margin:0">&#x1F4C8; All-Time Cumulative Outreach Growth</div>
-        <span id="cumulative-total-badge" style="font-size:11px;font-family:var(--mono);font-weight:700;color:var(--accent)">0 sent ever</span>
+      <div class="chart-card card-3d">
+        <h3>&#x1F31F; Session Results</h3>
+        <div style="height:120px;position:relative"><canvas id="chart-donut"></canvas></div>
       </div>
-      <canvas id="chart-cumulative" height="110"></canvas>
+      <div class="chart-card card-3d">
+        <h3>&#x1F4C5; Emails Per Day</h3>
+        <div style="height:120px;position:relative"><canvas id="chart-bar"></canvas></div>
+      </div>
     </div>
 
-    <!-- Heatmap -->
-    <div class="card" style="margin-top:14px">
-      <div class="card-title">&#x23F0; Hourly Heatmap</div>
-      <div id="hourly-heatmap" style="display:flex;gap:3px;align-items:flex-end;height:70px;padding:6px 0"></div>
-      <div id="hourly-labels" style="display:flex;gap:3px;margin-top:3px"></div>
+    <!-- Secondary Charts: Cumulative Growth & Week-over-Week -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px" class="perspective-root">
+      <div class="card card-3d" style="margin:0;padding:10px 14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <div class="card-title" style="margin:0">&#x1F4C8; Cumulative Growth</div>
+          <span id="cumulative-total-badge" style="font-size:10px;font-family:var(--mono);font-weight:700;color:var(--accent)">0 sent ever</span>
+        </div>
+        <div style="height:80px;position:relative"><canvas id="chart-cumulative"></canvas></div>
+      </div>
+      <div class="card card-3d" style="margin:0;padding:10px 14px">
+        <div class="card-title" style="margin-bottom:6px">&#x1F4C5; Week-over-Week</div>
+        <div style="height:80px;position:relative"><canvas id="chart-weekly"></canvas></div>
+      </div>
     </div>
 
-    <!-- Weekly -->
-    <div class="card" style="margin-top:14px">
-      <div class="card-title">&#x1F4C5; Week-over-Week</div>
-      <canvas id="chart-weekly" height="110"></canvas>
+    <!-- Status Breakdown & Top Domains -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px" class="perspective-root">
+      <div class="chart-card card-3d">
+        <h3>&#x1F4CB; Status Breakdown</h3>
+        <div style="height:120px;position:relative"><canvas id="chart-status-pie"></canvas></div>
+      </div>
+      <div class="chart-card card-3d">
+        <h3>&#x1F3E0; Top Domains</h3>
+        <div class="domain-list" id="domain-list" style="max-height:120px;overflow-y:auto"></div>
+      </div>
     </div>
 
-    <!-- Status + Domains -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px">
-      <div class="chart-card"><h3>&#x1F4CB; Status Breakdown</h3><canvas id="chart-status-pie" width="200" height="200"></canvas></div>
-      <div class="chart-card"><h3>&#x1F3E0; Top Domains</h3><div class="domain-list" id="domain-list"></div></div>
-    </div>
-
-    <!-- ═══ v7.0: A/B TESTING & SEND-TIME OPTIMIZER ═══ -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px">
+    <!-- A/B Testing & Send-Time Optimizer -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
       <!-- A/B Test Card -->
-      <div class="card" style="padding:16px">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div class="card" style="padding:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
           <div class="card-title" style="margin:0">&#x1F9EA; Subject Line A/B Test</div>
-          <span id="ab-winner-badge" class="badge" style="background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.3)">Active</span>
+          <span id="ab-winner-badge" class="badge" style="background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.3);font-size:9.5px">Active</span>
         </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
-          <div style="background:rgba(0,0,0,.15);border:1px solid var(--border);border-radius:10px;padding:12px">
-            <div style="font-weight:800;font-size:11px;color:var(--accent);margin-bottom:4px">VARIANT A</div>
-            <div style="font-size:18px;font-weight:900" id="ab-a-rate">0%</div>
-            <div style="font-size:10px;color:var(--text-dim)"><span id="ab-a-opened">0</span> opened / <span id="ab-a-sent">0</span> sent</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+          <div style="background:rgba(0,0,0,.15);border:1px solid var(--border);border-radius:8px;padding:8px 10px">
+            <div style="font-weight:800;font-size:10px;color:var(--accent);margin-bottom:2px">VARIANT A</div>
+            <div style="font-size:16px;font-weight:900" id="ab-a-rate">0%</div>
+            <div style="font-size:9px;color:var(--text-dim)"><span id="ab-a-opened">0</span> opened / <span id="ab-a-sent">0</span> sent</div>
           </div>
-          <div style="background:rgba(0,0,0,.15);border:1px solid var(--border);border-radius:10px;padding:12px">
-            <div style="font-weight:800;font-size:11px;color:var(--accent2);margin-bottom:4px">VARIANT B</div>
-            <div style="font-size:18px;font-weight:900" id="ab-b-rate">0%</div>
-            <div style="font-size:10px;color:var(--text-dim)"><span id="ab-b-opened">0</span> opened / <span id="ab-b-sent">0</span> sent</div>
+          <div style="background:rgba(0,0,0,.15);border:1px solid var(--border);border-radius:8px;padding:8px 10px">
+            <div style="font-weight:800;font-size:10px;color:var(--accent2);margin-bottom:2px">VARIANT B</div>
+            <div style="font-size:16px;font-weight:900" id="ab-b-rate">0%</div>
+            <div style="font-size:9px;color:var(--text-dim)"><span id="ab-b-opened">0</span> opened / <span id="ab-b-sent">0</span> sent</div>
           </div>
         </div>
-        <div id="ab-confidence-text" style="font-size:11px;color:var(--text-dim)">Collecting variant performance data...</div>
+        <div id="ab-confidence-text" style="font-size:10px;color:var(--text-dim)">Collecting variant performance data...</div>
       </div>
 
       <!-- Send-Time Optimizer Card -->
-      <div class="card" style="padding:16px">
-        <div class="card-title" style="margin-bottom:8px">&#x26A1; Send-Time Intelligence</div>
-        <div style="margin-bottom:10px">
-          <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px">AI Optimal Sending Recommendation:</div>
-          <div id="opt-hours-badge" class="badge" style="background:rgba(129,140,248,.12);color:var(--accent);border:1px solid rgba(129,140,248,.3);font-size:11px;padding:6px 12px">Analyzing historical open patterns...</div>
+      <div class="card" style="padding:12px">
+        <div class="card-title" style="margin-bottom:6px">&#x26A1; Send-Time Intelligence</div>
+        <div style="margin-bottom:8px">
+          <div style="font-size:10px;color:var(--text-dim);margin-bottom:4px">AI Optimal Sending Recommendation:</div>
+          <div id="opt-hours-badge" class="badge" style="background:rgba(129,140,248,.12);color:var(--accent);border:1px solid rgba(129,140,248,.3);font-size:10px;padding:4px 10px">Analyzing historical open patterns...</div>
         </div>
-        <div id="opt-top-hours" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+        <div id="opt-top-hours" style="display:flex;gap:5px;flex-wrap:wrap"></div>
       </div>
     </div>
 
-    <!-- ═══ v7.0: DOMAIN REPUTATION & COMPANY ANALYTICS ═══ -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px">
+    <!-- Domain Blacklist & Company Engagement -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
       <!-- Blacklist Widget -->
-      <div class="card" style="padding:16px">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div class="card" style="padding:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
           <div class="card-title" style="margin:0">&#x1F6AB; Smart Domain Blacklist</div>
-          <button class="btn btn-ghost" onclick="clearBlacklist()" style="padding:2px 8px;font-size:10px">Clear All</button>
+          <button class="btn btn-ghost" onclick="clearBlacklist()" style="padding:2px 6px;font-size:9.5px">Clear</button>
         </div>
-        <div id="bl-list" style="max-height:220px;overflow-y:auto">
-          <div style="font-size:11px;color:var(--text-dim);text-align:center;padding:16px">No auto-blacklisted domains</div>
+        <div id="bl-list" style="max-height:140px;overflow-y:auto">
+          <div style="font-size:10.5px;color:var(--text-dim);text-align:center;padding:12px">No auto-blacklisted domains</div>
         </div>
       </div>
 
       <!-- Company Analytics Widget -->
-      <div class="card" style="padding:16px">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <div class="card" style="padding:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
           <div class="card-title" style="margin:0">&#x1F3E2; Company Engagement</div>
-          <input type="text" id="company-search" placeholder="Search..." oninput="filterCompanyAnalytics(this.value)" class="form-input" style="width:130px;padding:3px 8px;font-size:11px"/>
+          <input type="text" id="company-search" placeholder="Search..." oninput="filterCompanyAnalytics(this.value)" class="form-input" style="width:120px;padding:2px 6px;font-size:10px"/>
         </div>
-        <div id="company-analytics-table" style="max-height:220px;overflow-y:auto"></div>
+        <div id="company-analytics-table" style="max-height:140px;overflow-y:auto"></div>
       </div>
     </div>
 
-    <!-- ═══ v8.5: HOURLY RECRUITER ACTIVITY HEATMAP ═══ -->
-    <div class="card" style="margin-top:14px;padding:16px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+    <!-- 24-Hour Recruiter Open Activity Heatmap -->
+    <div class="card" style="margin-top:10px;padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px">
         <div>
           <div class="card-title" style="margin:0">&#x1F552; 24-Hour Recruiter Open Activity Heatmap</div>
-          <div style="font-size:11px;color:var(--text-dim);margin-top:2px">Distribution of historical sends &bull; <span style="color:var(--green);font-weight:700">Green bars = Prime Recruiter Response Window</span></div>
+          <div style="font-size:10px;color:var(--text-dim);margin-top:1px">Distribution &bull; <span style="color:var(--green);font-weight:700">Green = Prime HR Window</span></div>
         </div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <span id="heatmap-peak-badge" class="badge" style="background:rgba(52,211,153,.15);color:var(--green);border:1px solid rgba(52,211,153,.3);font-size:10px">Loading...</span>
-          <button class="btn btn-ghost" onclick="loadHourlyHeatmap()" style="padding:2px 8px;font-size:10px">&#x21BB;</button>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span id="heatmap-peak-badge" class="badge" style="background:rgba(52,211,153,.15);color:var(--green);border:1px solid rgba(52,211,153,.3);font-size:9.5px">Loading...</span>
+          <button class="btn btn-ghost" onclick="loadHourlyHeatmap()" style="padding:2px 6px;font-size:9px">&#x21BB;</button>
         </div>
       </div>
-      <div id="hourly-heatmap-bars" style="display:grid;grid-template-columns:repeat(24,1fr);gap:4px;align-items:flex-end;height:120px;padding:10px 0;background:rgba(0,0,0,.15);border-radius:8px;border:1px solid var(--border)"></div>
-      <div style="display:grid;grid-template-columns:repeat(24,1fr);gap:4px;margin-top:4px;text-align:center;font-family:var(--mono);font-size:8px;color:var(--text-dim)" id="hourly-heatmap-labels"></div>
-      <div style="margin-top:10px;font-size:11px;color:var(--text-dim);display:flex;justify-content:space-between;align-items:center">
-        <span>💡 <strong>Recommendation:</strong> Schedule sends between <strong>09:00 - 11:30 AM</strong> &amp; <strong>14:00 - 16:30 PM</strong> for 3.2x higher interview reply rates.</span>
-        <a href="/api/reports/campaign-summary-csv" download="ResumeAuto_Campaign_Report.csv" class="btn btn-b" style="padding:3px 10px;font-size:10px;text-decoration:none">&#x1F4CA; Export CSV</a>
+      <div id="hourly-heatmap-bars" style="display:grid;grid-template-columns:repeat(24,1fr);gap:3px;align-items:flex-end;height:55px;padding:6px 0;background:rgba(0,0,0,.15);border-radius:6px;border:1px solid var(--border)"></div>
+      <div style="display:grid;grid-template-columns:repeat(24,1fr);gap:3px;margin-top:2px;text-align:center;font-family:var(--mono);font-size:7.5px;color:var(--text-dim)" id="hourly-heatmap-labels"></div>
+      <div style="margin-top:6px;font-size:10px;color:var(--text-dim);display:flex;justify-content:space-between;align-items:center">
+        <span>💡 <strong>Recommendation:</strong> Prime windows: <strong>09:00 - 11:30 AM</strong> &amp; <strong>14:00 - 16:30 PM</strong></span>
+        <a href="/api/reports/campaign-summary-csv" download="ResumeAuto_Campaign_Report.csv" class="btn btn-b" style="padding:2px 8px;font-size:9px;text-decoration:none">&#x1F4CA; Export CSV</a>
       </div>
     </div>
 
-    <!-- Best Time -->
-    <div class="card" style="margin-top:14px;background:rgba(0,0,0,.15)">
-      <div class="card-title">&#x26A1; Best Time to Send</div>
-      <div class="best-time-row">
+    <!-- Best Time Badges -->
+    <div class="card" style="margin-top:10px;background:rgba(0,0,0,.15);padding:10px 14px">
+      <div class="card-title" style="margin-bottom:6px">&#x26A1; Best Time to Send</div>
+      <div class="best-time-row" style="display:flex;gap:8px;flex-wrap:wrap">
         <span class="best-time-badge">&#x2705; Tue&#x2013;Thu: Highest opens</span>
         <span class="best-time-badge">&#x2705; 8&#x2013;10am: Best visibility</span>
         <span class="best-time-badge">&#x2705; Follow up after 5&#x2013;7 days</span>
       </div>
     </div>
 
-    <div style="margin-top:12px"><button class="btn btn-ghost" onclick="loadAnalytics()">&#x21BB; Refresh Analytics</button></div>
+    <div style="margin-top:10px"><button class="btn btn-ghost" onclick="loadAnalytics()" style="padding:4px 10px;font-size:11px">&#x21BB; Refresh Analytics</button></div>
   </div>
 
     <!-- ══════════ JOBS TAB (Sections 13 & 14) ══════════ -->
@@ -8363,8 +8493,14 @@ function applyAnalyticsBundle(b) {
           },
           options: {
             responsive: true,
-            cutout: '70%',
-            plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8', font: { size: 11, family: 'Inter' } } } }
+            maintainAspectRatio: false,
+            cutout: '72%',
+            plugins: {
+              legend: {
+                position: 'right',
+                labels: { boxWidth: 10, boxHeight: 10, color: '#94a3b8', font: { size: 10, family: 'Inter' }, padding: 6 }
+              }
+            }
           }
         });
       }
@@ -8388,15 +8524,16 @@ function applyAnalyticsBundle(b) {
               backgroundColor: 'rgba(129,140,248,0.5)',
               borderColor: '#818cf8',
               borderWidth: 1,
-              borderRadius: 6
+              borderRadius: 4
             }]
           },
           options: {
             responsive: true,
+            maintainAspectRatio: false,
             plugins: { legend: { display: false } },
             scales: {
-              x: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { display: false } },
-              y: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } }
+              x: { ticks: { color: '#64748b', font: { size: 8 } }, grid: { display: false } },
+              y: { ticks: { color: '#64748b', font: { size: 9 }, maxTicksLimit: 4 }, grid: { color: 'rgba(255,255,255,0.03)' } }
             }
           }
         });
@@ -8418,16 +8555,17 @@ function applyAnalyticsBundle(b) {
             data: {
               labels: b.weekly.labels,
               datasets: [
-                { label: 'This Week', data: b.weekly.thisWeek, borderColor: '#818cf8', backgroundColor: 'rgba(129,140,248,0.1)', fill: true, tension: .4, pointRadius: 3 },
-                { label: 'Last Week', data: b.weekly.lastWeek, borderColor: '#64748b', borderDash: [4, 4], fill: false, tension: .4, pointRadius: 2 }
+                { label: 'This Week', data: b.weekly.thisWeek, borderColor: '#818cf8', backgroundColor: 'rgba(129,140,248,0.1)', fill: true, tension: .4, pointRadius: 2.5 },
+                { label: 'Last Week', data: b.weekly.lastWeek, borderColor: '#64748b', borderDash: [3, 3], fill: false, tension: .4, pointRadius: 2 }
               ]
             },
             options: {
               responsive: true,
-              plugins: { legend: { labels: { color: '#94a3b8', font: { size: 10 } } } },
+              maintainAspectRatio: false,
+              plugins: { legend: { position: 'top', align: 'end', labels: { boxWidth: 8, boxHeight: 8, color: '#94a3b8', font: { size: 9 } } } },
               scales: {
-                x: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { display: false } },
-                y: { ticks: { color: '#64748b' }, grid: { color: 'rgba(255,255,255,0.03)' } }
+                x: { ticks: { color: '#64748b', font: { size: 8 } }, grid: { display: false } },
+                y: { ticks: { color: '#64748b', font: { size: 9 }, maxTicksLimit: 3 }, grid: { color: 'rgba(255,255,255,0.03)' } }
               }
             }
           });
@@ -8457,8 +8595,14 @@ function applyAnalyticsBundle(b) {
             },
             options: {
               responsive: true,
-              cutout: '65%',
-              plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8', font: { size: 10 } } } }
+              maintainAspectRatio: false,
+              cutout: '68%',
+              plugins: {
+                legend: {
+                  position: 'right',
+                  labels: { boxWidth: 8, boxHeight: 8, color: '#94a3b8', font: { size: 9.5 }, padding: 4 }
+                }
+              }
             }
           });
         }
@@ -8488,16 +8632,17 @@ function applyAnalyticsBundle(b) {
                 backgroundColor: 'rgba(129,140,248,0.15)',
                 fill: true,
                 tension: 0.3,
-                pointRadius: 3,
+                pointRadius: 2.5,
                 pointBackgroundColor: '#818cf8'
               }]
             },
             options: {
               responsive: true,
+              maintainAspectRatio: false,
               plugins: { legend: { display: false } },
               scales: {
-                x: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { display: false } },
-                y: { ticks: { color: '#64748b' }, grid: { color: 'rgba(255,255,255,0.03)' } }
+                x: { ticks: { color: '#64748b', font: { size: 8 } }, grid: { display: false } },
+                y: { ticks: { color: '#64748b', font: { size: 9 }, maxTicksLimit: 3 }, grid: { color: 'rgba(255,255,255,0.03)' } }
               }
             }
           });
@@ -8631,7 +8776,7 @@ async function loadAnalyticsLegacy() {
     setTxt('a-remaining', d.remaining);
   } catch (e) {}
 }
-function renderGoalRing(label,current,target,pct,color){var r=36,c=2*Math.PI*r,offset=c-(pct/100*c);return'<div class="goal-ring"><svg width="90" height="90" viewBox="0 0 90 90"><circle cx="45" cy="45" r="'+r+'" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="6"/><circle cx="45" cy="45" r="'+r+'" fill="none" stroke="'+color+'" stroke-width="6" stroke-dasharray="'+c+'" stroke-dashoffset="'+offset+'" stroke-linecap="round" style="transition:stroke-dashoffset .6s ease"/><text x="45" y="42" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="900" font-family="Inter">'+pct+'%</text><text x="45" y="56" text-anchor="middle" fill="var(--text-dim)" font-size="9" font-weight="600" font-family="Inter">'+current+'/'+target+'</text></svg><div class="ring-label">'+label+'</div></div>'}
+function renderGoalRing(label,current,target,pct,color){var r=25,c=2*Math.PI*r,offset=c-(pct/100*c);return'<div class="goal-ring"><svg width="62" height="62" viewBox="0 0 62 62"><circle cx="31" cy="31" r="'+r+'" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="5"/><circle cx="31" cy="31" r="'+r+'" fill="none" stroke="'+color+'" stroke-width="5" stroke-dasharray="'+c+'" stroke-dashoffset="'+offset+'" stroke-linecap="round" style="transition:stroke-dashoffset .6s ease"/><text x="31" y="29" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="900" font-family="Inter">'+pct+'%</text><text x="31" y="41" text-anchor="middle" fill="var(--text-dim)" font-size="7.5" font-weight="600" font-family="Inter">'+current+'/'+target+'</text></svg><div class="ring-label">'+label+'</div></div>'}
 async function loadFunnelStats(){try{var d=await(await fetch('/api/funnel/stats')).json();setTxt('fn-sent',d.totalSent);setTxt('fn-opened',d.totalOpened);setTxt('fn-resume',d.totalResumeClicked);setTxt('fn-replied',d.totalReplied);setTxt('fn-interviews',d.totalInterviews);setTxt('fn-open-rate',d.openRate+'%');setTxt('fn-click-rate',d.clickRate+'%');setTxt('fn-reply-rate',d.replyRate+'%');if(typeof renderSvgFunnel==='function')renderSvgFunnel(d.totalSent||0,d.totalOpened||0,d.totalReplied||0,d.totalInterviews||0,0)}catch(e){}}
 
 // ── Jobs (Handled by Enhanced Workable Table) ──
