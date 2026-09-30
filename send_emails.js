@@ -5158,15 +5158,311 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .sparkline-container{height:28px;width:120px;display:flex;align-items:flex-end;gap:1px}
 .spark-bar{flex:1;min-width:3px;border-radius:2px 2px 0 0;background:var(--accent);opacity:.6;transition:height .3s ease}
 
-/* Responsive */
-@media(max-width:768px){
-  .stats{grid-template-columns:repeat(2,1fr)}.charts-grid{grid-template-columns:1fr}.template-grid{grid-template-columns:1fr}
-  .settings-grid{grid-template-columns:1fr}.kanban-board{grid-template-columns:repeat(5,240px)}.analytics-top{grid-template-columns:repeat(2,1fr)}
-  .header{flex-direction:column;align-items:flex-start}.header-right{width:100%;justify-content:space-between}
-  .fab-container{bottom:16px;right:16px}
-  .notif-dropdown{right:-60px;width:320px}
+/* ═══════════════ MOBILE & RESPONSIVE PERFECTION ═══════════════ */
+.header-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.header-status-bar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+
+/* Global scroll containment to prevent horizontal page overflow */
+html, body {
+  max-width: 100vw;
+  overflow-x: hidden;
 }
-@media(max-width:480px){.stats{grid-template-columns:1fr}.funnel-grid{grid-template-columns:repeat(2,1fr)}.container{padding:14px 10px}}
+
+/* Tablet & Mobile (<= 768px) */
+@media(max-width: 768px) {
+  .container {
+    padding: 12px 10px;
+    max-width: 100vw;
+    box-sizing: border-box;
+  }
+  .card {
+    padding: 16px 14px;
+    border-radius: 12px;
+  }
+  .header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+  .header-left {
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .header-right {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: stretch;
+  }
+  .theme-pill {
+    width: 100%;
+    display: flex;
+    overflow-x: auto;
+    padding: 3px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    box-sizing: border-box;
+  }
+  .theme-pill::-webkit-scrollbar { display: none; }
+  .t-btn {
+    flex: 1;
+    padding: 6px 4px;
+    font-size: 10px;
+    text-align: center;
+    white-space: nowrap;
+  }
+  .header-actions {
+    width: 100%;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+  .header-actions .btn {
+    flex: 1 1 auto;
+    padding: 6px 8px;
+    font-size: 11px;
+    justify-content: center;
+    white-space: nowrap;
+  }
+  #header-sparkline {
+    display: none !important; /* Hide tiny dotted sparkline on mobile */
+  }
+  .cmd-palette-btn, .header-actions button:has(.kbd) {
+    display: none !important; /* Touch devices do not use keyboard shortcuts */
+  }
+  #dash-active-resume {
+    max-width: 90px;
+  }
+  .header-status-bar {
+    width: 100%;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .header-status-bar .status-pill {
+    flex: 1 1 auto;
+    padding: 6px 10px;
+    font-size: 11px;
+    justify-content: center;
+  }
+  #btn-emergency-stop {
+    flex: 1 1 100%;
+    justify-content: center;
+    padding: 8px;
+    font-size: 12px;
+  }
+  
+  /* Tabs: silky smooth horizontal carousel */
+  .tabs {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    white-space: nowrap;
+    padding: 6px;
+    border-radius: 12px;
+    margin-bottom: 16px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab-btn {
+    padding: 8px 14px;
+    font-size: 11px;
+    flex-shrink: 0;
+    border-radius: 8px;
+  }
+
+  /* Autopilot Card */
+  #autopilot-command-card {
+    padding: 14px;
+  }
+  .ap-header {
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 10px !important;
+  }
+  .ap-header > div:first-child {
+    width: 100%;
+  }
+  #btn-ap-master-toggle {
+    width: 100%;
+    justify-content: center;
+    padding: 9px 12px;
+  }
+  .ap-stats-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+    gap: 6px !important;
+  }
+  .ap-stats-grid > div {
+    padding: 8px 10px !important;
+  }
+
+  /* Progress Card */
+  .prog-card {
+    padding: 16px 14px;
+  }
+  .prog-top .num {
+    font-size: 24px;
+  }
+  .prog-meta {
+    display: grid !important;
+    grid-template-columns: repeat(2, 1fr) !important;
+    gap: 6px 10px !important;
+    margin-top: 12px !important;
+  }
+  .prog-meta span {
+    font-size: 10px;
+    background: rgba(255, 255, 255, 0.03);
+    padding: 5px 8px;
+    border-radius: 6px;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  /* Milestones */
+  .timeline {
+    padding: 6px 0;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .timeline::-webkit-scrollbar { display: none; }
+  .timeline-node {
+    min-width: 55px;
+  }
+  .timeline-line {
+    min-width: 12px;
+  }
+
+  /* Controls Section */
+  .controls {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 12px;
+  }
+  .controls .btn {
+    flex: 1 1 auto;
+    justify-content: center;
+    padding: 8px 10px;
+    font-size: 11px;
+  }
+  .spd {
+    margin-left: 0;
+    width: 100%;
+    display: flex;
+    gap: 4px;
+    overflow-x: auto;
+    padding: 4px 0;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .spd::-webkit-scrollbar { display: none; }
+  .sbtn {
+    flex: 1;
+    text-align: center;
+    padding: 6px 2px;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+
+  /* Stats & Funnels */
+  .stats {
+    grid-template-columns: repeat(2, 1fr) !important;
+    gap: 8px;
+  }
+  .stat {
+    padding: 12px;
+  }
+  .stat-val {
+    font-size: 22px;
+  }
+  .funnel-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+    gap: 6px;
+  }
+  .funnel-card {
+    padding: 10px 8px;
+  }
+  .funnel-card .f-val {
+    font-size: 18px;
+  }
+
+  /* General Grids (Settings, Analytics, Charts, Templates) */
+  .charts-grid,
+  .template-grid,
+  .settings-grid,
+  .analytics-top {
+    grid-template-columns: 1fr !important;
+  }
+  .kanban-board {
+    display: flex;
+    overflow-x: auto;
+    gap: 10px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .kanban-col {
+    min-width: 250px;
+    flex-shrink: 0;
+  }
+
+  /* Force any inline 2-col or 3-col layouts into responsive 1-col on mobile */
+  [style*="grid-template-columns:1fr 1fr"],
+  [style*="grid-template-columns: 1fr 1fr"],
+  [style*="grid-template-columns:1fr 1fr 1fr"],
+  [style*="grid-template-columns: 1fr 1fr 1fr"],
+  [style*="grid-template-columns:auto 1fr"] {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Dropdown & Modals */
+  .notif-dropdown {
+    right: 0 !important;
+    left: auto !important;
+    width: min(320px, 92vw) !important;
+  }
+  .modal-box {
+    padding: 20px 16px;
+    width: 94vw;
+    max-width: 94vw;
+  }
+  .modal-stats {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .fab-container {
+    bottom: 16px;
+    right: 16px;
+  }
+  .fab-btn {
+    width: 46px;
+    height: 46px;
+    font-size: 20px;
+  }
+}
+
+/* Extra small devices (<= 480px) */
+@media(max-width: 480px) {
+  .ap-stats-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .stat {
+    padding: 10px;
+  }
+  .stat-val {
+    font-size: 20px;
+  }
+  .funnel-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+}
 </style>
 </head>
 <body>
@@ -5188,7 +5484,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <button class="t-btn" onclick="setTheme('sunset',this)">&#x1F305; Sunset</button>
         <button class="t-btn" onclick="setTheme('light',this)">&#x2600; Light</button>
       </div>
-      <div style="display:flex;gap:6px;align-items:center">
+      <div class="header-actions">
         <div class="sparkline-container" id="header-sparkline" title="Sends/min (last 30 ticks)"></div>
         <button class="btn btn-ghost" id="btn-inbox-header" onclick="switchTab('inbox',document.getElementById('tab-inbox'))" title="Recruiter Inbox Activities" style="padding:6px 12px;font-size:11px">
           &#x1F4E5; Inbox <span id="inbox-hdr-badge" style="display:none;background:var(--green);color:#000;font-size:9px;font-weight:900;border-radius:10px;padding:1px 6px;margin-left:4px"></span>
@@ -5211,11 +5507,13 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           🤖 Autopilot: <span id="hdr-autopilot-status" style="font-weight:900">ON</span>
         </button>
         <a href="/api/reports/campaign-summary-csv" download="ResumeAuto_Campaign_Report.csv" class="btn btn-ghost" title="Download Full Campaign Performance Report (CSV)" style="text-decoration:none;padding:6px 12px;font-size:11px">&#x1F4CA; Report</a>
-        <button class="btn btn-ghost" onclick="toggleCmdPalette()" title="Command Palette (Ctrl+K)" style="padding:6px 10px"><span class="kbd">&#x2318;K</span></button>
+        <button class="btn btn-ghost cmd-palette-btn" onclick="toggleCmdPalette()" title="Command Palette (Ctrl+K)" style="padding:6px 10px"><span class="kbd">&#x2318;K</span></button>
       </div>
-      <div class="status-pill" title="Worker Telemetry & Queue Engine" style="display:flex;align-items:center;gap:6px"><span id="worker-status-text" style="color:var(--green);font-weight:700">● READY</span><span style="color:var(--text-dim)">|</span><span style="font-size:10px;color:var(--text-dim)">Queue:</span><span id="worker-queue-text" style="font-weight:800;color:var(--accent)">0</span></div>
-      <div class="status-pill"><div class="dot stopped" id="dot"></div><span id="stxt">Ready</span></div>
-      <button class="btn btn-r" id="btn-emergency-stop" onclick="triggerEmergencyStop()" title="Emergency Stop All Automation (Hold Queues)" style="padding:6px 12px;font-size:11px;font-weight:800;letter-spacing:0.5px">🛑 STOP ALL</button>
+      <div class="header-status-bar">
+        <div class="status-pill" title="Worker Telemetry & Queue Engine" style="display:flex;align-items:center;gap:6px"><span id="worker-status-text" style="color:var(--green);font-weight:700">● READY</span><span style="color:var(--text-dim)">|</span><span style="font-size:10px;color:var(--text-dim)">Queue:</span><span id="worker-queue-text" style="font-weight:800;color:var(--accent)">0</span></div>
+        <div class="status-pill"><div class="dot stopped" id="dot"></div><span id="stxt">Ready</span></div>
+        <button class="btn btn-r" id="btn-emergency-stop" onclick="triggerEmergencyStop()" title="Emergency Stop All Automation (Hold Queues)" style="padding:6px 12px;font-size:11px;font-weight:800;letter-spacing:0.5px">🛑 STOP ALL</button>
+      </div>
     </div>
   </div>
 
@@ -5239,7 +5537,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   <div id="panel-dashboard" class="tab-panel active">
     <!-- ═══ v8.6: AUTOPILOT COMMAND CENTER ═══ -->
     <div class="card" id="autopilot-command-card" style="margin-bottom:14px;background:linear-gradient(135deg,rgba(99,102,241,0.08) 0%,rgba(168,85,247,0.05) 100%);border:1px solid rgba(139,92,246,0.3);position:relative;overflow:hidden">
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+      <div class="ap-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
         <div style="display:flex;align-items:center;gap:12px">
           <div style="font-size:24px;width:42px;height:42px;border-radius:10px;background:rgba(99,102,241,0.18);display:flex;align-items:center;justify-content:center;border:1px solid rgba(99,102,241,0.4)">🤖</div>
           <div>
@@ -5258,7 +5556,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
           </button>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.06);font-size:11px">
+      <div class="ap-stats-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.06);font-size:11px">
         <div style="background:rgba(0,0,0,0.2);padding:8px 12px;border-radius:8px;border:1px solid var(--border)">
           <div style="color:var(--text-dim);font-size:10px">RECRUITER WINDOW</div>
           <div style="font-weight:700;margin-top:2px;display:flex;align-items:center;gap:6px">
