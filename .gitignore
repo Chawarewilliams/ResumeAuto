@@ -24,6 +24,7 @@ progress.json
 
 # Sensitive Application Data & Recruiter Leads
 emails.txt
+campaign_paste*.txt
 settings.json
 jobs.json
 recruiters.json

@@ -362,6 +362,7 @@ function evaluateEmailSafety(rawEmail, options = {}) {
     allowPersonal = false,
     acquireLock = false,
     skipCooldown = false,
+    skipLockCheck = false,
     isCooldownFunc = null,
     ownSenderAddresses = [],
   } = options;
@@ -462,15 +463,18 @@ function evaluateEmailSafety(rawEmail, options = {}) {
   }
 
   // 8. Active In-Flight Send Lock Check (Race Condition Guard)
-  if (hasActiveSendLock(normalized)) {
-    return {
-      eligible: false,
-      status: "DUPLICATE_ACTIVE_LOCK",
-      reason: `Outreach to ${normalized} is currently in-flight by an active worker stream`,
-      normalizedEmail: normalized,
-      domain,
-      company,
-    };
+  if (!skipLockCheck && hasActiveSendLock(normalized)) {
+    const existingLock = _activeSendLocks.get(normalized);
+    if (!existingLock || workerId === null || workerId === undefined || existingLock.workerId !== workerId) {
+      return {
+        eligible: false,
+        status: "DUPLICATE_ACTIVE_LOCK",
+        reason: `Outreach to ${normalized} is currently in-flight by an active worker stream`,
+        normalizedEmail: normalized,
+        domain,
+        company,
+      };
+    }
   }
 
   // 9. Historical Cooldown Check

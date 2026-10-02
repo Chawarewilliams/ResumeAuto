@@ -23,6 +23,15 @@ const express = require("express");
 const Imap = require("imap");
 const { simpleParser } = require("mailparser");
 const dns = require("dns");
+// Ensure robust DNS resolution using reliable public DNS (fixes Windows 127.0.0.1 loopback ECONNREFUSED)
+try {
+  const currentServers = dns.getServers();
+  if (!currentServers || currentServers.length === 0 || currentServers.some(s => s === "127.0.0.1" || s === "::1")) {
+    dns.setServers(["8.8.8.8", "1.1.1.1", "8.8.4.4"]);
+  }
+} catch (e) {
+  try { dns.setServers(["8.8.8.8", "1.1.1.1"]); } catch(_) {}
+}
 const net = require("net");
 
 // ─── RESUMEAUTO V9 INTELLIGENT ENGINE MODULES ──────────────────
@@ -176,12 +185,12 @@ const DEFAULT_CONFIG = {
   autoPauseConsecutiveFailures: parseInt(process.env.AUTO_PAUSE_FAILURES) || 3,
   enableSoundAlerts: process.env.SOUND_ALERTS !== "false",
   resendSentEmails: process.env.RESEND_SENT_EMAILS === "true",
-  skipPersonalGmail: process.env.SKIP_PERSONAL_GMAIL !== "false", // default true: business emails only
+  skipPersonalGmail: process.env.SKIP_PERSONAL_GMAIL === "true", // default false: no personal email restriction
   plainTextOnly: process.env.PLAIN_TEXT_ONLY === "true",
-  onlySendInBusinessHours: process.env.BUSINESS_HOURS_ONLY !== "false",
+  onlySendInBusinessHours: process.env.BUSINESS_HOURS_ONLY === "true",
   businessStartHour: parseInt(process.env.BUSINESS_START_HOUR) || 9,
   businessEndHour: parseInt(process.env.BUSINESS_END_HOUR) || 18,
-  skipWeekends: process.env.SKIP_WEEKENDS !== "false",
+  skipWeekends: process.env.SKIP_WEEKENDS === "true",
   enableHumanJitter: process.env.HUMAN_JITTER !== "false",
   webhookUrl: process.env.WEBHOOK_URL || "",
   enableWebhookAlerts: process.env.WEBHOOK_ALERTS === "true",
@@ -241,7 +250,11 @@ function loadSettings() {
   try {
     if (fs.existsSync(SETTINGS_FILE)) {
       const saved = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
-      return { ...DEFAULT_CONFIG, ...saved, accounts: DEFAULT_CONFIG.accounts };
+      const merged = { ...DEFAULT_CONFIG, ...saved, accounts: DEFAULT_CONFIG.accounts };
+      if (process.env.DASHBOARD_PORT || process.env.PORT) {
+        merged.dashboardPort = parseInt(process.env.DASHBOARD_PORT || process.env.PORT);
+      }
+      return merged;
     }
   } catch (e) {
     console.error("⚠️  Error loading settings file:", e.message);
@@ -1336,6 +1349,58 @@ function markSent(email, company = "", account = "") {
   invalidateAnalyticsCache();
 }
 
+function instantLockEmails(emailList) {
+  const valid = [];
+  const now = new Date();
+  const date = now.toISOString().split("T")[0];
+  const hour = now.getHours();
+  const seen = new Set();
+
+  for (const item of emailList) {
+    const em = (typeof item === "string" ? item : (item.email || "")).toLowerCase().trim();
+    if (em && em.includes("@") && !seen.has(em)) {
+      seen.add(em);
+      valid.push(`${em}|${date}|${hour}`);
+      if (_sentLogEntriesCache && _sentLogSetCache) {
+        _sentLogEntriesCache.push({ email: em, date, hour });
+        _sentLogSetCache.add(em);
+      }
+    }
+  }
+
+  if (valid.length > 0) {
+    fs.appendFileSync(SENT_LOG, valid.join("\n") + "\n");
+    invalidateAnalyticsCache();
+  }
+  return valid.length;
+}
+
+function unlockEmailsFromSentLog(emailList) {
+  const targets = new Set(emailList.map(item => (typeof item === "string" ? item : (item.email || "")).toLowerCase().trim()).filter(Boolean));
+  if (targets.size === 0 || !fs.existsSync(SENT_LOG)) return 0;
+
+  const raw = fs.readFileSync(SENT_LOG, "utf8");
+  const lines = raw.split("\n");
+  const remaining = [];
+  let removedCount = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const email = trimmed.split("|")[0].toLowerCase().trim();
+    if (targets.has(email)) {
+      removedCount++;
+    } else {
+      remaining.push(trimmed);
+    }
+  }
+
+  fs.writeFileSync(SENT_LOG, remaining.join("\n") + (remaining.length > 0 ? "\n" : ""));
+  invalidateSentLogCache();
+  invalidateAnalyticsCache();
+  return removedCount;
+}
+
 // ─── ANALYTICS (in-memory aggregation with result caching) ────
 let _analyticsCache = null;
 let _analyticsCacheTime = 0;
@@ -1769,11 +1834,13 @@ function getMailAttachment() {
 }
 
 // ─── SEND ONE EMAIL (with retry & AI personalization & tracking) ──────────
-async function sendOne(transporter, to, company, context = "", jobId = null, attempt = 0) {
+async function sendOne(transporter, to, company, context = "", jobId = null, attempt = 0, workerId = null) {
   const safety = evaluateEmailSafety(to, {
     company,
+    workerId,
     allowPersonal: CONFIG.skipPersonalGmail === false,
     skipCooldown: true, // cooldown already validated before dispatch
+    skipLockCheck: true, // lock already acquired by sendWorker
     acquireLock: false,
     ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
   });
@@ -1873,7 +1940,7 @@ async function sendOne(transporter, to, company, context = "", jobId = null, att
       state.retried++;
       addLog(`🔄  Retry ${attempt + 1}/${CONFIG.maxRetries - 1} for ${to}`, "warn");
       await sleep(CONFIG.retryDelay);
-      return sendOne(transporter, to, company, context, jobId, attempt + 1);
+      return sendOne(transporter, to, company, context, jobId, attempt + 1, workerId);
     }
     return { success: false, error: errMsg, permanent: isPermanentErr };
   }
@@ -1886,6 +1953,9 @@ const _inFlightMxCache = new Map();
 let _inFlightBlockedCount = 0;
 
 function checkIsRecruiterWindow() {
+  if (!CONFIG.onlySendInBusinessHours) {
+    return { inWindow: true, reason: "24/7 Unrestricted Window (All Hours & Days Active)", nextWindow: "Now" };
+  }
   const now = new Date();
   const day = now.getDay();
   const hour = now.getHours();
@@ -1923,12 +1993,12 @@ function startAutopilotSupervisor() {
       return;
     }
 
-    // Inside recruiter window!
-    state.autopilotStatus = "Active — Peak Recruiter Window";
+    // Inside active sending window!
+    state.autopilotStatus = CONFIG.onlySendInBusinessHours ? "Active — Peak Recruiter Window" : "Active — 24/7 Unrestricted Mode";
 
     if (state.running && state.paused) {
       state.paused = false;
-      addLog("☀️ [Autopilot] Peak recruiter window arrived! Resuming outreach campaign...", "success");
+      addLog(CONFIG.onlySendInBusinessHours ? "☀️ [Autopilot] Peak recruiter window arrived! Resuming outreach campaign..." : "☀️ [Autopilot] Sending window active! Resuming outreach campaign...", "success");
       return;
     }
 
@@ -2001,13 +2071,13 @@ async function sendEmails() {
       while (state.paused) { await sleep(500); }
       if (!state.running || stopping) break;
 
-      // Check Business Hours Window / Autopilot Recruiter Window
-      if (CONFIG.onlySendInBusinessHours || state.autopilot) {
+      // Check Business Hours Window / Recruiter Window (only if enabled)
+      if (CONFIG.onlySendInBusinessHours) {
         const win = checkIsRecruiterWindow();
         if (!win.inWindow) {
           if (workerId === 0) {
             state.autopilotStatus = `Sleeping — ${win.reason}`;
-            addLog(`🌙 Outside recruiter window (${win.reason}) — Autopilot paused until ${win.nextWindow}`, "warn");
+            addLog(`🌙 Outside recruiter window (${win.reason}) — Campaign paused until ${win.nextWindow}`, "warn");
           }
           await sleep(30000);
           continue;
@@ -2115,7 +2185,13 @@ async function sendEmails() {
               const mx = await dns.promises.resolveMx(dom);
               _inFlightMxCache.set(dom, Boolean(mx && mx.length > 0));
             } catch (e) {
-              _inFlightMxCache.set(dom, false);
+              // Only consider domain unreachable if DNS affirmatively confirms non-existence (ENOTFOUND / ENODATA).
+              // For network/resolver issues (ECONNREFUSED, ETIMEOUT, SERVFAIL), fail-open so valid leads are never wrongly blocked!
+              if (e.code === "ENOTFOUND" || e.code === "ENODATA") {
+                _inFlightMxCache.set(dom, false);
+              } else {
+                _inFlightMxCache.set(dom, true);
+              }
             }
           }
           if (!_inFlightMxCache.get(dom)) {
@@ -2131,7 +2207,7 @@ async function sendEmails() {
 
       let result;
       try {
-        result = await sendOne(activeTransporter, email, company, context, jobId);
+        result = await sendOne(activeTransporter, email, company, context, jobId, 0, `worker-${workerId}`);
       } finally {
         releaseSendLock(safety.normalizedEmail);
       }
@@ -2318,6 +2394,54 @@ function startDashboard() {
       return res.json({ ok: true, message: "Campaign paused", running: state.running, paused: true });
     }
 
+    if (action === "start_and_lock" || action === "send_and_lock") {
+      state.paused = false;
+      CONFIG.resendSentEmails = false;
+      saveSettings(CONFIG);
+      allEmails = loadAllEmailFiles();
+      state.total = allEmails.length;
+      state.remainingEmails = Math.max(0, state.total - state.sent);
+      addLog(`🚀  Campaign Started: "Send Mail & Lock" active (6-month cooldown enforced on ${allEmails.length} leads)`, "success");
+      if (!state.running && allEmails.length > 0) {
+        sendEmails().catch(err => addLog(`Send error: ${err.message}`, "error"));
+      }
+      return res.json({ ok: true, message: "Campaign started with 6-month lock active", total: allEmails.length, running: true, paused: false, resendSentEmails: false });
+    }
+
+    if (action === "start_bypass_lock" || action === "send_all") {
+      state.paused = false;
+      CONFIG.resendSentEmails = true;
+      saveSettings(CONFIG);
+      allEmails = loadAllEmailFiles();
+      state.total = allEmails.length;
+      state.remainingEmails = Math.max(0, state.total - state.sent);
+      addLog(`⚡  Campaign Started: "Send All (Bypass Lock)" active (all ${allEmails.length} leads eligible)`, "success");
+      if (!state.running && allEmails.length > 0) {
+        sendEmails().catch(err => addLog(`Send error: ${err.message}`, "error"));
+      }
+      return res.json({ ok: true, message: "Campaign started bypassing 6-month lock", total: allEmails.length, running: true, paused: false, resendSentEmails: true });
+    }
+
+    if (action === "instant_lock_all") {
+      const all = loadAllEmailFiles();
+      const lockedCount = instantLockEmails(all.map(e => e.email));
+      allEmails = loadAllEmailFiles();
+      state.total = allEmails.length;
+      state.remainingEmails = Math.max(0, state.total - state.sent);
+      addLog(`🔒  Instant Lock All: ${lockedCount} email(s) from current queue locked into 6-month cooldown`, "warn");
+      return res.json({ ok: true, message: `Locked ${lockedCount} emails into 6-month cooldown`, count: lockedCount });
+    }
+
+    if (action === "instant_unlock_all") {
+      const all = loadAllEmailFiles();
+      const unlockedCount = unlockEmailsFromSentLog(all.map(e => e.email));
+      allEmails = loadAllEmailFiles();
+      state.total = allEmails.length;
+      state.remainingEmails = Math.max(0, state.total - state.sent);
+      addLog(`🔓  Instant Unlock All: ${unlockedCount} email(s) unlocked from cooldown`, "success");
+      return res.json({ ok: true, message: `Unlocked ${unlockedCount} emails from cooldown`, count: unlockedCount });
+    }
+
     if (action === "resume" || action === "start") {
       state.paused = false;
       allEmails = loadAllEmailFiles();
@@ -2391,6 +2515,14 @@ function startDashboard() {
       const allowGmail = !CONFIG.skipPersonalGmail;
       addLog(`📧  @gmail.com sending ${allowGmail ? 'ENABLED — personal @gmail.com leads included' : 'DISABLED — personal @gmail.com excluded (business only)'} (${allEmails.length} leads in queue)`, allowGmail ? 'success' : 'warn');
       return res.json({ ok: true, allowGmail, skipPersonalGmail: CONFIG.skipPersonalGmail, total: allEmails.length });
+    }
+
+    if (action === "toggleMxShield" || action === "toggleAutoVerifyMx") {
+      CONFIG.autoVerifyMxOnSend = !CONFIG.autoVerifyMxOnSend;
+      saveSettings({ autoVerifyMxOnSend: CONFIG.autoVerifyMxOnSend });
+      const enabled = CONFIG.autoVerifyMxOnSend;
+      addLog(`🛡️  In-Flight DNS/MX Shield ${enabled ? 'ENABLED — verifying recipient mail servers' : 'DISABLED — sending to all lead domains directly without DNS checks'}`, enabled ? 'info' : 'warn');
+      return res.json({ ok: true, autoVerifyMxOnSend: CONFIG.autoVerifyMxOnSend });
     }
 
     if (speed) {
@@ -3725,7 +3857,7 @@ function startDashboard() {
       addLog("🤖 [Autopilot] Mode ACTIVATED — autonomous scheduling & in-flight shield online", "success");
       const win = checkIsRecruiterWindow();
       if (win.inWindow) {
-        state.autopilotStatus = "Active — Peak Recruiter Window";
+        state.autopilotStatus = CONFIG.onlySendInBusinessHours ? "Active — Peak Recruiter Window" : "Active — 24/7 Unrestricted Mode";
         if (!state.running) {
           const unsent = loadAllEmailFiles();
           if (unsent.length > 0) {
@@ -4771,20 +4903,93 @@ async function checkAndSyncInbox(options = {}) {
   // Paste daily emails → auto-filter → auto-campaign
   app.post("/api/campaign/quick-paste", (req, res) => {
     try {
-      const { emails: rawEmails, autoStart = true } = req.body;
+      const { emails: rawEmails, autoStart = true, mode = "send_and_lock" } = req.body;
       if (!rawEmails || typeof rawEmails !== "string" || !rawEmails.trim()) {
         return res.status(400).json({ error: "Paste your email list (one per line)" });
       }
 
+      // Mode 1: INSTANT LOCK (Instantly marks emails into 6-month cooldown without sending)
+      if (mode === "instant_lock") {
+        const emailMatches = rawEmails.toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi) || [];
+        const unique = Array.from(new Set(emailMatches));
+        const lockedCount = instantLockEmails(unique);
+        allEmails = loadAllEmailFiles();
+        state.total = allEmails.length;
+        state.remainingEmails = Math.max(0, state.total - state.sent);
+        addLog(`🔒  Instant Lock: ${lockedCount} email(s) locked into 6-month cooldown guard`, "warn");
+        logActivity({
+          eventType: "INSTANT_LOCK",
+          entity: "Campaign",
+          status: "SUCCESS",
+          message: `Instant Lock: ${lockedCount} email(s) placed into 6-month cooldown`,
+          metadata: { count: lockedCount }
+        });
+        return res.json({
+          ok: true,
+          mode: "instant_lock",
+          lockedCount,
+          message: `🔒 Successfully locked ${lockedCount} email(s) into 6-month cooldown!`,
+          summary: {
+            total: unique.length,
+            ready: 0,
+            cooldownBlocked: lockedCount,
+            personalBlocked: 0,
+            suppressed: 0,
+            invalid: 0,
+            rawReport: { totalSubmitted: unique.length, eligible: 0, rejected: lockedCount }
+          },
+          ready: [],
+          cooldownBlocked: unique.slice(0, 50).map(em => ({ email: em, reason: "Locked via Instant Lock" }))
+        });
+      }
+
+      // Mode 2: INSTANT UNLOCK (Clears emails from cooldown so they can be mailed immediately)
+      if (mode === "instant_unlock") {
+        const emailMatches = rawEmails.toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi) || [];
+        const unique = Array.from(new Set(emailMatches));
+        const unlockedCount = unlockEmailsFromSentLog(unique);
+        allEmails = loadAllEmailFiles();
+        state.total = allEmails.length;
+        state.remainingEmails = Math.max(0, state.total - state.sent);
+        addLog(`🔓  Instant Unlock: ${unlockedCount} email(s) unlocked from 6-month cooldown guard`, "success");
+        logActivity({
+          eventType: "INSTANT_UNLOCK",
+          entity: "Campaign",
+          status: "SUCCESS",
+          message: `Instant Unlock: ${unlockedCount} email(s) unlocked from cooldown`,
+          metadata: { count: unlockedCount }
+        });
+        return res.json({
+          ok: true,
+          mode: "instant_unlock",
+          unlockedCount,
+          message: `🔓 Successfully unlocked ${unlockedCount} email(s) from cooldown!`,
+          summary: {
+            total: unique.length,
+            ready: unlockedCount,
+            cooldownBlocked: 0,
+            personalBlocked: 0,
+            suppressed: 0,
+            invalid: 0,
+            rawReport: { totalSubmitted: unique.length, eligible: unlockedCount, rejected: 0 }
+          },
+          ready: unique.slice(0, 50).map(em => ({ email: em, company: "Ready" })),
+          cooldownBlocked: []
+        });
+      }
+
+      // Mode 3: SEND_ALL / BYPASS_LOCK or SEND_AND_LOCK
+      const bypassLock = (mode === "send_all" || mode === "bypass_lock");
       const lines = rawEmails.split("\n");
       const report = evaluateBatchSafety(lines, {
         allowPersonal: CONFIG.skipPersonalGmail === false,
+        skipCooldown: bypassLock, // When bypassLock is true, cooldown check is bypassed
         isCooldownFunc: isInCooldown,
         ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
       });
 
       const ready = report.ready;
-      const cooldownBlocked = report.rejected.filter(r => r.status === "SKIPPED_COOLDOWN");
+      const cooldownBlocked = bypassLock ? [] : report.rejected.filter(r => r.status === "SKIPPED_COOLDOWN");
       const suppressed = report.rejected.filter(r => r.status === "SUPPRESSED");
       const personalBlocked = report.rejected.filter(r => r.status === "BLOCKED_PERSONAL_DOMAIN");
       const invalid = report.rejected.filter(r => r.status === "INVALID_SYNTAX");
@@ -4799,7 +5004,8 @@ async function checkAndSyncInbox(options = {}) {
         savedFile = `campaign_paste${nextNum}.txt`;
         const content = ready.map(r => r.company !== "Your Company" ? `${r.email}, ${r.company}` : r.email).join("\n");
         fs.writeFileSync(path.join(EMAILS_DIR, savedFile), content);
-        addLog(`📋  Quick Campaign: ${ready.length} emails saved to ${savedFile} (${cooldownBlocked.length} in cooldown, ${personalBlocked.length} personal blocked, ${invalid.length} invalid)`, "success");
+        const lockNote = bypassLock ? " [Bypass 6-Month Lock]" : " [Send Mail & Lock Active]";
+        addLog(`📋  Quick Campaign${lockNote}: ${ready.length} emails saved to ${savedFile} (${cooldownBlocked.length} in cooldown, ${personalBlocked.length} personal blocked, ${invalid.length} invalid)`, "success");
 
         // Reload queue
         allEmails = loadAllEmailFiles();
@@ -4818,13 +5024,15 @@ async function checkAndSyncInbox(options = {}) {
         eventType: "QUICK_CAMPAIGN_PASTE",
         entity: "Campaign",
         status: ready.length > 0 ? "SUCCESS" : "WARN",
-        message: `Quick paste: ${ready.length} ready, ${cooldownBlocked.length} in cooldown, ${personalBlocked.length} personal blocked, ${invalid.length} invalid`,
-        metadata: { ready: ready.length, cooldown: cooldownBlocked.length, personalBlocked: personalBlocked.length, invalid: invalid.length, suppressed: suppressed.length, file: savedFile }
+        message: `Quick paste (${mode}): ${ready.length} ready, ${cooldownBlocked.length} in cooldown, ${personalBlocked.length} personal blocked, ${invalid.length} invalid`,
+        metadata: { mode, ready: ready.length, cooldown: cooldownBlocked.length, personalBlocked: personalBlocked.length, invalid: invalid.length, suppressed: suppressed.length, file: savedFile }
       });
 
       res.json({
         ok: true,
         savedFile,
+        mode,
+        bypassLock,
         autoStarted: autoStart && ready.length > 0,
         summary: {
           total: report.uniqueCount,
@@ -4913,6 +5121,31 @@ async function checkAndSyncInbox(options = {}) {
     }
   });
 
+  // ─── INSTANT LOCK & UNLOCK DIRECT APIS ────────────────────────
+  app.post("/api/cooldown/lock", (req, res) => {
+    try {
+      const { email, emails } = req.body || {};
+      const list = emails ? (Array.isArray(emails) ? emails : String(emails).split("\n")) : (email ? [email] : []);
+      const lockedCount = instantLockEmails(list);
+      addLog(`🔒  Instant Lock: ${lockedCount} email(s) locked into 6-month cooldown`, "warn");
+      res.json({ ok: true, lockedCount, message: `Successfully locked ${lockedCount} email(s)` });
+    } catch(e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/cooldown/unlock", (req, res) => {
+    try {
+      const { email, emails } = req.body || {};
+      const list = emails ? (Array.isArray(emails) ? emails : String(emails).split("\n")) : (email ? [email] : []);
+      const unlockedCount = unlockEmailsFromSentLog(list);
+      addLog(`🔓  Instant Unlock: ${unlockedCount} email(s) unlocked from cooldown`, "success");
+      res.json({ ok: true, unlockedCount, message: `Successfully unlocked ${unlockedCount} email(s)` });
+    } catch(e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ─── EMAIL SAFETY ENGINE APIS (Section 4 & 5) ──────────────────
   app.post("/api/safety/check", (req, res) => {
     try {
@@ -4920,7 +5153,7 @@ async function checkAndSyncInbox(options = {}) {
       if (email && typeof email === "string") {
         const verdict = evaluateEmailSafety(email, {
           company,
-          allowPersonal: CONFIG.skipPersonalGmail === false,
+          allowPersonal: req.body.allowPersonal !== undefined ? Boolean(req.body.allowPersonal) : false,
           isCooldownFunc: isInCooldown,
           ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
         });
@@ -4934,7 +5167,7 @@ async function checkAndSyncInbox(options = {}) {
 
       const batchReport = evaluateBatchSafety(list, {
         company,
-        allowPersonal: CONFIG.skipPersonalGmail === false,
+        allowPersonal: req.body.allowPersonal !== undefined ? Boolean(req.body.allowPersonal) : false,
         isCooldownFunc: isInCooldown,
         ownSenderAddresses: CONFIG.accounts.map(a => a.gmailAddress),
       });
@@ -6683,8 +6916,8 @@ html, body {
 
   <!-- ═══ TABS ═══ -->
   <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('dashboard',this)" id="tab-dashboard">&#x1F680; Dashboard</button>
-    <button class="tab-btn" onclick="switchTab('campaigns',this)" id="tab-campaigns">🚀 Campaigns</button>
+    <button class="tab-btn active" onclick="switchTab('dashboard',this)" id="tab-dashboard">&#x1F680; Dashboard &amp; Campaigns</button>
+    <button class="tab-btn" onclick="switchTab('dashboard',this)" id="tab-campaigns" style="display:none">&#x1F680; Campaigns</button>
     <button class="tab-btn" onclick="switchTab('matching',this)" id="tab-matching">🎯 Match &amp; Resumes</button>
     <button class="tab-btn" onclick="switchTab('recruiters',this)" id="tab-recruiters">👥 Recruiters &amp; Shield</button>
     <button class="tab-btn" onclick="switchTab('template',this)" id="tab-template">&#x1F4DD; Template</button>
@@ -6790,6 +7023,8 @@ html, body {
       </div>
       <div class="stat card-3d"><div class="stat-icon">&#x23ED;&#xFE0F;</div><div class="stat-val y" id="sk">0</div><div class="stat-lbl">Skipped</div></div>
       <div class="stat card-3d"><div class="stat-icon">&#x1F504;</div><div class="stat-val b" id="sr">0</div><div class="stat-lbl">Retried</div></div>
+      <div class="stat card-3d"><div class="stat-icon">&#x23F3;</div><div class="stat-val y" id="camp-stat-queued">0</div><div class="stat-lbl">Queued Leads</div></div>
+      <div class="stat card-3d"><div class="stat-icon">&#x1F3AF;</div><div class="stat-val b" id="camp-stat-matched">0</div><div class="stat-lbl">Matched</div></div>
       <div class="stat card-3d" onclick="switchTab('jobs',document.getElementById('tab-jobs'))">
         <div class="stat-icon">&#x1F4CB;</div><div class="stat-val p" id="sj">0</div><div class="stat-lbl">Jobs Tracked</div>
       </div>
@@ -6807,18 +7042,127 @@ html, body {
       </div>
     </div>
 
+    <!-- ══════════ QUICK CAMPAIGN PASTE & 6-MONTH COOLDOWN GUARD ══════════ -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;margin-bottom:16px">
+      <!-- Quick Campaign Paste Card -->
+      <div class="card" style="margin-bottom:0;background:linear-gradient(135deg,rgba(52,211,153,0.06) 0%,rgba(96,165,250,0.04) 100%);border:1px solid rgba(52,211,153,0.25)">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+          <div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="font-size:20px">&#x1F4CB;</span>
+              <h3 style="margin:0;font-size:15px;font-weight:800;color:var(--text)">Quick Campaign Paste</h3>
+              <span class="badge" style="background:rgba(52,211,153,0.2);color:var(--green);font-size:9px;font-weight:800">DAILY EMAILS</span>
+            </div>
+            <div style="font-size:11px;color:var(--text-dim);margin-top:3px">Paste daily emails &bull; Auto-filter duplicates &bull; 6-month cooldown guard &bull; Launch</div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn btn-b" onclick="quickCampaignPreview()" style="font-size:11px" title="Preview cooldown status before sending">&#x1F50D; Preview</button>
+            <button class="btn btn-g" onclick="quickCampaignAction('send_and_lock')" style="font-weight:800;font-size:11px" title="Send to eligible emails and lock them in 6-month cooldown">&#x1F680; Send Mail &amp; Lock</button>
+            <button class="btn btn-p" onclick="quickCampaignAction('send_all')" style="font-weight:800;font-size:11px" title="Send to ALL valid emails (bypass 6-month cooldown lock)">&#x26A1; Send All (Bypass Lock)</button>
+            <button class="btn btn-y" onclick="quickCampaignAction('instant_lock')" style="font-size:11px" title="Instantly lock all pasted emails into 6-month cooldown without sending">&#x1F512; Instant Lock</button>
+            <button class="btn btn-ghost" onclick="quickCampaignAction('instant_unlock')" style="font-size:11px" title="Unlock pasted emails from cooldown">&#x1F513; Instant Unlock</button>
+            <button class="btn btn-b" onclick="quickCampaignAction('save_only')" style="font-size:11px" title="Save emails without starting">&#x1F4BE; Save Only</button>
+          </div>
+        </div>
+
+        <textarea id="qc-paste-area" class="form-input" placeholder="Paste emails here — one per line&#10;&#10;Format:&#10;hr@company.com&#10;recruiter@firm.com, Company Name&#10;hiring@startup.io, Startup Inc, Python Django&#10;&#10;&#x1F512; Previously sent emails (last 6 months) will be auto-skipped with 'Send Mail &amp; Lock'.&#10;&#x26A1; Use 'Send All (Bypass Lock)' to email all leads regardless of cooldown lock.&#10;&#x1F512; Use 'Instant Lock' to lock leads immediately without sending." style="width:100%;height:140px;font-family:var(--mono);font-size:12px;resize:vertical;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:10px;padding:12px;color:var(--text);line-height:1.6"></textarea>
+
+        <!-- Preview Results Box (hidden by default) -->
+        <div id="qc-preview-box" style="display:none;margin-top:12px;background:rgba(0,0,0,0.25);border:1px solid var(--border);border-radius:12px;padding:14px">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+            <span style="font-size:16px">&#x1F4CA;</span>
+            <span style="font-size:13px;font-weight:800;color:var(--text)">Paste Analysis Results</span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:10px">
+            <div style="text-align:center;padding:8px;background:rgba(52,211,153,0.08);border:1px solid rgba(52,211,153,0.2);border-radius:8px">
+              <div id="qc-ready-count" style="font-size:20px;font-weight:900;color:var(--green)">0</div>
+              <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px">&#x2705; Ready</div>
+            </div>
+            <div style="text-align:center;padding:8px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.2);border-radius:8px">
+              <div id="qc-cooldown-count" style="font-size:20px;font-weight:900;color:var(--yellow)">0</div>
+              <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px">&#x1F512; 6-Mo Lock</div>
+            </div>
+            <div style="text-align:center;padding:8px;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.2);border-radius:8px">
+              <div id="qc-invalid-count" style="font-size:20px;font-weight:900;color:var(--red)">0</div>
+              <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px">&#x274C; Invalid</div>
+            </div>
+            <div style="text-align:center;padding:8px;background:rgba(192,132,252,0.08);border:1px solid rgba(192,132,252,0.2);border-radius:8px">
+              <div id="qc-suppressed-count" style="font-size:20px;font-weight:900;color:var(--purple)">0</div>
+              <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px">&#x1F6AB; Blocked</div>
+            </div>
+          </div>
+
+          <div id="qc-preview-actions" style="display:flex;gap:6px;flex-wrap:wrap;padding:8px;margin-bottom:8px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px">
+            <button class="btn btn-g" onclick="quickCampaignAction('send_and_lock')" style="font-size:10px;font-weight:800">&#x1F680; Send Mail &amp; Lock (<span id="qc-btn-ready-cnt">0</span> Ready)</button>
+            <button class="btn btn-p" onclick="quickCampaignAction('send_all')" style="font-size:10px;font-weight:800">&#x26A1; Send All (<span id="qc-btn-all-cnt">0</span>)</button>
+            <button class="btn btn-y" onclick="quickCampaignAction('instant_lock')" style="font-size:10px">&#x1F512; Instant Lock All</button>
+            <button class="btn btn-ghost" onclick="quickCampaignAction('instant_unlock')" style="font-size:10px">&#x1F513; Instant Unlock</button>
+          </div>
+
+          <div id="qc-cooldown-list" style="display:none;max-height:120px;overflow-y:auto;margin-bottom:8px;padding:8px;background:rgba(251,191,36,0.05);border:1px solid rgba(251,191,36,0.15);border-radius:8px">
+            <div style="font-size:10px;font-weight:700;color:var(--yellow);margin-bottom:4px">&#x1F512; Cooldown-Locked Emails:</div>
+            <div id="qc-cooldown-emails" style="font-family:var(--mono);font-size:10px;color:var(--text-dim);line-height:1.5"></div>
+          </div>
+
+          <div id="qc-result-msg" style="font-size:11px;color:var(--text-dim);text-align:center;padding:4px"></div>
+        </div>
+      </div>
+
+      <!-- 6-Month Cooldown Guard Card -->
+      <div class="card" style="margin-bottom:0;background:linear-gradient(135deg,rgba(251,191,36,0.05) 0%,rgba(248,113,113,0.03) 100%);border:1px solid rgba(251,191,36,0.2)">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+          <div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="font-size:18px">&#x1F512;</span>
+              <h3 style="margin:0;font-size:15px;font-weight:800;color:var(--text)">6-Month Cooldown Guard</h3>
+            </div>
+            <div style="font-size:11px;color:var(--text-dim);margin-top:3px">Previously contacted recruiters are locked for 6 months. Unlocks automatically.</div>
+          </div>
+          <button class="btn btn-ghost" onclick="loadCooldownStatsUI()" style="font-size:11px">&#x21BB; Refresh</button>
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px">
+          <div style="text-align:center;padding:10px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:8px">
+            <div id="cd-total" style="font-size:22px;font-weight:900;color:var(--accent)">—</div>
+            <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px">Total Sent</div>
+          </div>
+          <div style="text-align:center;padding:10px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);border-radius:8px">
+            <div id="cd-locked" style="font-size:22px;font-weight:900;color:var(--yellow)">—</div>
+            <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px">&#x1F512; In Cooldown</div>
+          </div>
+          <div style="text-align:center;padding:10px;background:rgba(52,211,153,0.08);border:1px solid rgba(52,211,153,0.25);border-radius:8px">
+            <div id="cd-unlocked" style="font-size:22px;font-weight:900;color:var(--green)">—</div>
+            <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px">&#x2705; Unlocked</div>
+          </div>
+          <div style="text-align:center;padding:10px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:8px">
+            <div id="cd-cutoff" style="font-size:13px;font-weight:800;color:var(--text-bright);line-height:26px">—</div>
+            <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px">Cutoff Date</div>
+          </div>
+        </div>
+
+        <!-- Upcoming Unlocks List -->
+        <div id="cd-upcoming-box" style="display:none;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:8px;padding:10px">
+          <div style="font-size:10px;font-weight:700;color:var(--yellow);margin-bottom:6px">&#x23F3; Upcoming Cooldown Expirations (Unlocking soon):</div>
+          <div id="cd-upcoming-list" style="font-family:var(--mono);font-size:10px;color:var(--text-dim);max-height:100px;overflow-y:auto;line-height:1.5"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- Account bars -->
     <div class="accs" id="accs"></div>
 
     <!-- Controls -->
     <div class="controls">
       <span class="clbl">Control</span>
-      <button class="btn btn-g" id="btn-ctrl-main" onclick="ctrl('resume')" style="font-weight:800;padding:8px 16px">&#x25B6; Start Campaign</button>
+      <button class="btn btn-g" id="btn-ctrl-main" onclick="ctrl('start_and_lock')" style="font-weight:800;padding:8px 16px" title="Send mail and lock contacted recruiters in 6-month cooldown">&#x1F680; Send Mail &amp; Lock</button>
+      <button class="btn btn-p" onclick="ctrl('start_bypass_lock')" style="font-weight:800" title="Send to ALL leads in queue bypassing 6-month cooldown lock">&#x26A1; Send All (Bypass Lock)</button>
+      <button class="btn btn-y" onclick="openInstantLockModal()" style="font-weight:800" title="Instantly lock leads into cooldown without sending">&#x1F512; Instant Lock</button>
       <button class="btn btn-y" onclick="ctrl('pause')">&#x23F8; Pause</button>
       <button class="btn btn-r" onclick="if(confirm('Stop sending?'))ctrl('stop')">&#x23F9; Stop</button>
       <button class="btn btn-g" onclick="document.getElementById('direct-send-modal').classList.remove('hidden')" title="Send single email">&#x26A1; Direct</button>
       <button class="btn btn-b" onclick="toggleResendMode()" id="btn-resend-mode">&#x21BB; Resend OFF</button>
       <button class="btn btn-b" onclick="toggleGmailMode()" id="btn-gmail-mode" title="Toggle sending to @gmail.com recipient leads">&#x2709; @gmail: OFF</button>
+      <button class="btn btn-g" onclick="toggleMxShield()" id="btn-mx-shield" title="Toggle In-Flight DNS MX Verification Shield">🛡️ DNS Shield: ON</button>
       <button class="btn btn-p" onclick="ctrl('reload')" title="Reload queue and configuration from disk">&#x21BB; Reload Queue</button>
       <button class="btn btn-ghost" onclick="window.location.href='/api/log/export'">&#x1F4E5; Log</button>
       <button class="btn btn-ghost" onclick="document.getElementById('schedule-modal').classList.remove('hidden')">&#x23F0; Schedule</button>
@@ -7726,153 +8070,22 @@ html, body {
     </div>
   </div>
 
-  <!-- ══════════ CAMPAIGNS TAB (Section 20) ══════════ -->
-  <div id="panel-campaigns" class="tab-panel">
-    <div class="card glass-command card-3d" style="margin-bottom:16px;background:linear-gradient(135deg,rgba(99,102,241,0.08) 0%,rgba(168,85,247,0.05) 100%);border:1px solid rgba(139,92,246,0.3)">
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:14px">
-        <div>
-          <div style="display:flex;align-items:center;gap:10px">
-            <h2 style="margin:0;font-size:18px;font-weight:800;color:var(--text-bright)">Python Backend Recruiter Outreach</h2>
-            <span class="badge" id="camp-status-badge" style="background:rgba(52,211,153,0.2);color:var(--green);font-size:11px;font-weight:800">READY</span>
-          </div>
-          <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Primary Campaign Track &bull; Targeted Recruiter Engagement &bull; Automated Follow-up Guard</div>
-        </div>
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <button class="btn btn-g" id="btn-camp-start" onclick="ctrl('start')">▶ Start Campaign</button>
-          <button class="btn btn-y" id="btn-camp-pause" onclick="ctrl('pause')">⏸ Pause</button>
-          <button class="btn btn-r" id="btn-camp-stop" onclick="ctrl('stop')">⏹ Stop</button>
-          <button class="btn btn-b" id="btn-camp-gmail" onclick="toggleGmailMode()" style="font-size:11px" title="Toggle sending to @gmail.com leads">✉️ @gmail: OFF</button>
-          <button class="btn btn-r" onclick="triggerEmergencyStop()" style="font-weight:900">🛑 EMERGENCY STOP</button>
-        </div>
-      </div>
-      
-      <!-- Progress Bar -->
-      <div style="margin-bottom:12px">
-        <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px">
-          <span style="color:var(--text-dim)">Campaign Progression</span>
-          <span style="font-weight:700;color:var(--text-bright)"><span id="camp-pct">0</span>% (<span id="camp-sent">0</span> / <span id="camp-total">0</span> leads)</span>
-        </div>
-        <div class="p-bar"><div class="p-fill" id="camp-bar" style="width:0%"></div></div>
-      </div>
-
-      <!-- Speed Control in Campaign -->
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06)">
-        <span style="font-size:11px;font-weight:700;color:var(--text-dim)">STREAM DISPATCH SPEED:</span>
-        <div class="sp-grp">
-          <button class="sp-btn" id="camp-sp-stealth" onclick="setSpeed('stealth')">&#x1F977; Stealth (Human)</button>
-          <button class="sp-btn" id="camp-sp-slow" onclick="setSpeed('slow')">&#x1F422; Slow</button>
-          <button class="sp-btn active" id="camp-sp-medium" onclick="setSpeed('medium')">&#x1F6B6; Medium</button>
-          <button class="sp-btn" id="camp-sp-fast" onclick="setSpeed('fast')">&#x26A1; Fast</button>
-          <button class="sp-btn" id="camp-sp-turbo" onclick="setSpeed('turbo')">&#x1F680; Turbo</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Campaign Metrics Grid -->
-    <div class="stats perspective-root" style="margin-bottom:16px">
-      <div class="stat card-3d"><div class="stat-icon">💼</div><div class="stat-val" id="camp-stat-jobs" style="color:var(--accent)">0</div><div class="stat-lbl">Jobs Tracked</div></div>
-      <div class="stat card-3d"><div class="stat-icon">🎯</div><div class="stat-val" id="camp-stat-matched" style="color:var(--blue)">0</div><div class="stat-lbl">Matched</div></div>
-      <div class="stat card-3d"><div class="stat-icon">⏳</div><div class="stat-val" id="camp-stat-queued" style="color:var(--yellow)">0</div><div class="stat-lbl">Queued Leads</div></div>
-      <div class="stat card-3d"><div class="stat-icon">🚀</div><div class="stat-val" id="camp-stat-sent" style="color:var(--green)">0</div><div class="stat-lbl">Sent Successfully</div></div>
-      <div class="stat card-3d"><div class="stat-icon">⚠️</div><div class="stat-val" id="camp-stat-failed" style="color:var(--red)">0</div><div class="stat-lbl">Failed / Bounced</div></div>
-      <div class="stat card-3d"><div class="stat-icon">💬</div><div class="stat-val" id="camp-stat-replies" style="color:var(--purple)">0</div><div class="stat-lbl">Recruiter Replies</div></div>
-      <div class="stat card-3d"><div class="stat-icon">📅</div><div class="stat-val" id="camp-stat-interviews" style="color:#fbbf24">0</div><div class="stat-lbl">Interviews Scheduled</div></div>
-    </div>
-
-    <!-- ══════════ QUICK CAMPAIGN PASTE (Daily Emails) ══════════ -->
-    <div class="card" style="margin-bottom:16px;background:linear-gradient(135deg,rgba(52,211,153,0.06) 0%,rgba(96,165,250,0.04) 100%);border:1px solid rgba(52,211,153,0.25)">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
-        <div>
-          <div style="display:flex;align-items:center;gap:8px">
-            <span style="font-size:20px">&#x1F4CB;</span>
-            <h3 style="margin:0;font-size:16px;font-weight:800;color:var(--text)">Quick Campaign Paste</h3>
-            <span class="badge" style="background:rgba(52,211,153,0.2);color:var(--green);font-size:9px;font-weight:800">DAILY EMAILS</span>
-          </div>
-          <div style="font-size:11px;color:var(--text-dim);margin-top:3px">Paste daily emails &bull; Auto-filter duplicates &bull; 6-month cooldown guard &bull; One-click campaign launch</div>
-        </div>
-        <div style="display:flex;gap:6px">
-          <button class="btn btn-b" onclick="quickCampaignPreview()" style="font-size:11px" title="Preview cooldown status before sending">&#x1F50D; Preview</button>
-          <button class="btn btn-g" onclick="quickCampaignLaunch(true)" style="font-weight:800" title="Save emails & auto-start campaign">&#x1F680; Paste & Launch</button>
-          <button class="btn btn-y" onclick="quickCampaignLaunch(false)" style="font-size:11px" title="Save emails without starting">&#x1F4BE; Save Only</button>
-        </div>
-      </div>
-
-      <textarea id="qc-paste-area" class="form-input" placeholder="Paste emails here — one per line&#10;&#10;Format:&#10;hr@company.com&#10;recruiter@firm.com, Company Name&#10;hiring@startup.io, Startup Inc, Python Django&#10;&#10;&#x1F512; Previously sent emails (last 6 months) will be auto-skipped.&#10;&#x1F513; Emails older than 6 months will unlock automatically." style="width:100%;height:160px;font-family:var(--mono);font-size:12px;resize:vertical;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:10px;padding:12px;color:var(--text);line-height:1.6"></textarea>
-
-      <!-- Preview Results Box (hidden by default) -->
-      <div id="qc-preview-box" style="display:none;margin-top:12px;background:rgba(0,0,0,0.25);border:1px solid var(--border);border-radius:12px;padding:14px">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
-          <span style="font-size:16px">&#x1F4CA;</span>
-          <span style="font-size:13px;font-weight:800;color:var(--text)">Paste Analysis Results</span>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:10px">
-          <div style="text-align:center;padding:10px;background:rgba(52,211,153,0.08);border:1px solid rgba(52,211,153,0.2);border-radius:10px">
-            <div id="qc-ready-count" style="font-size:22px;font-weight:900;color:var(--green)">0</div>
-            <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px">&#x2705; Ready to Send</div>
-          </div>
-          <div style="text-align:center;padding:10px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.2);border-radius:10px">
-            <div id="qc-cooldown-count" style="font-size:22px;font-weight:900;color:var(--yellow)">0</div>
-            <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px">&#x1F512; 6-Month Lock</div>
-          </div>
-          <div style="text-align:center;padding:10px;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.2);border-radius:10px">
-            <div id="qc-invalid-count" style="font-size:22px;font-weight:900;color:var(--red)">0</div>
-            <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px">&#x274C; Invalid</div>
-          </div>
-          <div style="text-align:center;padding:10px;background:rgba(192,132,252,0.08);border:1px solid rgba(192,132,252,0.2);border-radius:10px">
-            <div id="qc-suppressed-count" style="font-size:22px;font-weight:900;color:var(--purple)">0</div>
-            <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px">&#x1F6AB; Suppressed</div>
-          </div>
-        </div>
-
-        <!-- Cooldown locked emails list -->
-        <div id="qc-cooldown-list" style="display:none;max-height:140px;overflow-y:auto;margin-bottom:8px;padding:8px;background:rgba(251,191,36,0.05);border:1px solid rgba(251,191,36,0.15);border-radius:8px">
-          <div style="font-size:10px;font-weight:700;color:var(--yellow);margin-bottom:4px">&#x1F512; Cooldown-Locked Emails (6 months not passed):</div>
-          <div id="qc-cooldown-emails" style="font-family:var(--mono);font-size:10px;color:var(--text-dim);line-height:1.6"></div>
-        </div>
-
-        <div id="qc-result-msg" style="font-size:11px;color:var(--text-dim);text-align:center;padding:6px"></div>
-      </div>
-    </div>
-
-    <!-- ══════════ COOLDOWN STATUS DASHBOARD ══════════ -->
-    <div class="card" style="margin-bottom:16px;background:linear-gradient(135deg,rgba(251,191,36,0.05) 0%,rgba(248,113,113,0.03) 100%);border:1px solid rgba(251,191,36,0.2)">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
-        <div>
-          <div style="display:flex;align-items:center;gap:8px">
-            <span style="font-size:18px">&#x1F512;</span>
-            <h3 style="margin:0;font-size:15px;font-weight:800;color:var(--text)">6-Month Cooldown Guard</h3>
-          </div>
-          <div style="font-size:11px;color:var(--text-dim);margin-top:3px">Previously sent emails are locked for 6 months to prevent repeat outreach. They unlock automatically.</div>
-        </div>
-        <button class="btn btn-ghost" onclick="loadCooldownStatsUI()" style="font-size:11px">&#x21BB; Refresh</button>
-      </div>
-
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:12px">
-        <div style="text-align:center;padding:12px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px">
-          <div id="cd-total" style="font-size:24px;font-weight:900;color:var(--accent)">—</div>
-          <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px">Total Unique Sent</div>
-        </div>
-        <div style="text-align:center;padding:12px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.2);border-radius:10px">
-          <div id="cd-locked" style="font-size:24px;font-weight:900;color:var(--yellow)">—</div>
-          <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px">&#x1F512; In Cooldown</div>
-        </div>
-        <div style="text-align:center;padding:12px;background:rgba(52,211,153,0.08);border:1px solid rgba(52,211,153,0.2);border-radius:10px">
-          <div id="cd-unlocked" style="font-size:24px;font-weight:900;color:var(--green)">—</div>
-          <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px">&#x1F513; Unlocked</div>
-        </div>
-        <div style="text-align:center;padding:12px;background:rgba(96,165,250,0.08);border:1px solid rgba(96,165,250,0.2);border-radius:10px">
-          <div id="cd-cutoff" style="font-size:13px;font-weight:700;color:var(--blue);padding-top:5px">—</div>
-          <div style="font-size:9px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px">Cutoff Date</div>
-        </div>
-      </div>
-
-      <!-- Upcoming Unlocks Timeline -->
-      <div id="cd-upcoming-box" style="display:none;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;padding:12px">
-        <div style="font-size:11px;font-weight:700;color:var(--text-dim);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px">&#x1F513; Upcoming Email Unlocks</div>
-        <div id="cd-upcoming-list" style="font-family:var(--mono);font-size:10px;color:var(--text-secondary);line-height:1.8;max-height:120px;overflow-y:auto"></div>
-      </div>
-    </div>
-
+  <!-- ══════════ CAMPAIGNS TAB ALIAS (Section 20) ══════════ -->
+  <div id="panel-campaigns" class="tab-panel" style="display:none">
+    <div id="camp-status-badge" style="display:none">READY</div>
+    <div id="camp-pct" style="display:none">0</div>
+    <div id="camp-sent" style="display:none">0</div>
+    <div id="camp-total" style="display:none">0</div>
+    <div id="camp-bar" style="display:none"></div>
+    <div id="btn-camp-start" style="display:none"></div>
+    <div id="btn-camp-pause" style="display:none"></div>
+    <div id="btn-camp-stop" style="display:none"></div>
+    <div id="btn-camp-gmail" style="display:none"></div>
+    <div id="camp-stat-jobs" style="display:none">0</div>
+    <div id="camp-stat-sent" style="display:none">0</div>
+    <div id="camp-stat-failed" style="display:none">0</div>
+    <div id="camp-stat-replies" style="display:none">0</div>
+    <div id="camp-stat-interviews" style="display:none">0</div>
   </div>
 
   <!-- ══════════ INTERVIEWS TRACKER TAB (Section 28) ══════════ -->
@@ -7986,6 +8199,65 @@ html, body {
       <button class="btn btn-ghost" onclick="document.getElementById('verify-queue-modal').classList.add('hidden')">Close</button>
       <button class="btn btn-r" id="btn-clean-invalid-leads" style="display:none" onclick="cleanInvalidLeadsSubmit()">&#x1F9F9; Clean Invalid Leads</button>
       <button class="btn btn-b" onclick="runQueueVerification()">&#x21BB; Re-Scan</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="instant-lock-modal">
+  <div class="modal-box" style="max-width:540px;text-align:left">
+    <button class="modal-close" onclick="closeInstantLockModal()">&#x2715;</button>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+      <span style="font-size:24px">&#x1F512;</span>
+      <div>
+        <h3 style="margin:0;font-size:17px;font-weight:800;color:var(--text)">Instant Lock &amp; Cooldown Guard</h3>
+        <p style="margin:2px 0 0 0;font-size:11px;color:var(--text-dim)">Lock recruiters into 6-month cooldown without sending, or choose how to dispatch campaign.</p>
+      </div>
+    </div>
+
+    <!-- Quick Action Launch Cards -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+      <div style="padding:12px;background:rgba(52,211,153,0.08);border:1px solid rgba(52,211,153,0.25);border-radius:10px;cursor:pointer;transition:all 0.2s" onclick="ctrl('start_and_lock');closeInstantLockModal();" title="Click to start campaign in Send Mail &amp; Lock mode">
+        <div style="font-size:12px;font-weight:800;color:var(--green);display:flex;align-items:center;gap:6px">
+          <span>&#x1F680;</span> Send Mail &amp; Lock
+        </div>
+        <div style="font-size:10px;color:var(--text-dim);margin-top:4px;line-height:1.4">
+          Sends only to leads NOT in cooldown. Automatically locks each recipient in 6-month cooldown.
+        </div>
+      </div>
+      <div style="padding:12px;background:rgba(192,132,252,0.08);border:1px solid rgba(192,132,252,0.25);border-radius:10px;cursor:pointer;transition:all 0.2s" onclick="ctrl('start_bypass_lock');closeInstantLockModal();" title="Click to start campaign bypassing cooldown">
+        <div style="font-size:12px;font-weight:800;color:var(--purple);display:flex;align-items:center;gap:6px">
+          <span>&#x26A1;</span> Send All (Bypass Lock)
+        </div>
+        <div style="font-size:10px;color:var(--text-dim);margin-top:4px;line-height:1.4">
+          Sends to ALL valid leads in queue, bypassing 6-month cooldown lock restrictions.
+        </div>
+      </div>
+    </div>
+
+    <!-- Entire Queue Instant Lock/Unlock -->
+    <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="font-size:12px;font-weight:700;color:var(--text-bright)">Batch Actions for Current Queue:</span>
+        <span id="modal-queue-tag" class="badge" style="background:rgba(96,165,250,0.15);color:var(--blue);font-size:10px">Queue Active</span>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-y" onclick="instantLockQueueAll()" style="font-size:11px" title="Lock all current queued emails into cooldown without sending">&#x1F512; Instant Lock All Queued</button>
+        <button class="btn btn-ghost" onclick="instantUnlockQueueAll()" style="font-size:11px" title="Unlock all current queued emails from cooldown">&#x1F513; Instant Unlock All Queued</button>
+      </div>
+    </div>
+
+    <!-- Paste Emails to Lock/Unlock -->
+    <div class="form-group" style="margin-bottom:12px">
+      <label class="form-label" style="display:flex;justify-content:space-between">
+        <span>Paste Specific Emails to Lock / Unlock (one per line):</span>
+      </label>
+      <textarea id="modal-lock-emails" class="form-input" rows="4" placeholder="recruiter@company.com&#10;hiring@firm.com" style="width:100%;font-family:var(--mono);font-size:11px;line-height:1.5;resize:vertical"></textarea>
+    </div>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end;align-items:center">
+      <button class="btn btn-ghost" onclick="closeInstantLockModal()">Close</button>
+      <button class="btn btn-ghost" onclick="submitInstantUnlockModal()" style="font-size:11px">&#x1F513; Instant Unlock</button>
+      <button class="btn btn-y" onclick="submitInstantLockModal()" style="font-size:11px;font-weight:800">&#x1F512; Instant Lock</button>
     </div>
   </div>
 </div>
@@ -8141,6 +8413,9 @@ function init3DTiltEngine(){
 
 // ── Tab Switching ──
 function switchTab(name,btn){
+  var isCampaignRoute = (name === 'campaigns');
+  if(isCampaignRoute) name = 'dashboard';
+
   var targetPanel=document.getElementById('panel-'+name);
   if(!targetPanel)return;
   document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('active')});
@@ -8150,14 +8425,19 @@ function switchTab(name,btn){
   if(btn)btn.classList.add('active');
 
   try {
-    var routePath = name === 'dashboard' ? '/' : '/' + name;
+    var routePath = isCampaignRoute ? '/campaigns' : (name === 'dashboard' ? '/' : '/' + name);
     if (window.location.pathname !== routePath) {
       history.pushState({ tab: name }, '', routePath);
     }
   } catch(e) {}
 
-  if(name==='dashboard'){loadFunnelStats();if(typeof loadMilestones==='function')loadMilestones();loadHourlyHeatmap()}
-  if(name==='campaigns'){if(typeof loadCampaignsUI==='function')loadCampaignsUI()}
+  if(name==='dashboard'){
+    loadFunnelStats();
+    if(typeof loadMilestones==='function')loadMilestones();
+    loadHourlyHeatmap();
+    if(typeof loadCampaignsUI==='function')loadCampaignsUI();
+    if(typeof loadCooldownStatsUI==='function')loadCooldownStatsUI();
+  }
   if(name==='interviews'){if(typeof loadInterviewsUI==='function')loadInterviewsUI()}
   if(name==='matching'){if(typeof loadCandidateProfileUI==='function')loadCandidateProfileUI();if(typeof loadResumeProfilesUI==='function')loadResumeProfilesUI()}
   if(name==='recruiters'){if(typeof loadRecruitersUI==='function')loadRecruitersUI();if(typeof loadSuppressionUI==='function')loadSuppressionUI();if(typeof loadBlockedDomainsUI==='function')loadBlockedDomainsUI()}
@@ -8210,22 +8490,24 @@ setTxt('sub','Speed: '+d.speed+' | '+( d.currentAccount||'\u2014')+schedTxt+rese
 var rb=document.getElementById('btn-resend-mode');if(rb){rb.textContent=d.resendMode?'\u21BB Resend ON':'\u21BB Resend OFF';rb.className=d.resendMode?'btn btn-y':'btn btn-b'}
 var gb=document.getElementById('btn-gmail-mode');if(gb){var allowG=(d.allowGmail!==undefined?d.allowGmail:(d.skipPersonalGmail===false));gb.innerHTML=allowG?'&#x2709; @gmail: ON':'&#x2709; @gmail: OFF';gb.className=allowG?'btn btn-g':'btn btn-b';gb.title=allowG?'Sending to @gmail.com is ENABLED (Click to toggle)':'Sending to @gmail.com is DISABLED (Click to toggle)'}
 var cgb=document.getElementById('btn-camp-gmail');if(cgb){var allowG2=(d.allowGmail!==undefined?d.allowGmail:(d.skipPersonalGmail===false));cgb.textContent=allowG2?'✉️ @gmail: ON':'✉️ @gmail: OFF';cgb.className=allowG2?'btn btn-g':'btn btn-b'}
+var mxb=document.getElementById('btn-mx-shield');if(mxb){var mxOn=(d.inFlightMx!==false);mxb.innerHTML=mxOn?'🛡️ DNS Shield: ON':'🛡️ DNS Shield: OFF';mxb.className=mxOn?'btn btn-g':'btn btn-b';mxb.title=mxOn?'DNS MX Pre-Check is ACTIVE (Click to toggle OFF)':'DNS MX Pre-Check is DISABLED (Click to toggle ON)'}
 animateNumber('ss',d.sent);animateNumber('sf',d.failed);animateNumber('sk',d.skipped);setTxt('sr',d.retried);animateNumber('sj',d.jobsCount||0);
 if(typeof updateAutopilotUI==='function')updateAutopilotUI(d);
 if(typeof updateCampaignsTabUI==='function')updateCampaignsTabUI(d);
 var dot=document.getElementById('dot'),stxt=document.getElementById('stxt'),btnMain=document.getElementById('btn-ctrl-main');
+window.__lastStateData = d;
 if(!d.running){
   if(dot) dot.className='dot stopped';
   if(stxt) stxt.textContent='Ready (Click Start)';
-  if(btnMain){btnMain.textContent='▶ Start Campaign';btnMain.className='btn btn-g';btnMain.onclick=function(){ctrl('start')};}
+  if(btnMain){btnMain.innerHTML='&#x1F680; Send Mail &amp; Lock';btnMain.className='btn btn-g';btnMain.onclick=function(){ctrl('start_and_lock')};}
 }else if(d.paused){
   if(dot) dot.className='dot paused';
   if(stxt) stxt.textContent='Paused';
-  if(btnMain){btnMain.textContent='▶ Resume Campaign';btnMain.className='btn btn-g';btnMain.onclick=function(){ctrl('resume')};}
+  if(btnMain){btnMain.innerHTML='▶ Resume Campaign';btnMain.className='btn btn-g';btnMain.onclick=function(){ctrl('resume')};}
 }else{
   if(dot) dot.className='dot';
   if(stxt) stxt.textContent='Sending (' + (d.sent||0) + '/' + (d.total||0) + ')';
-  if(btnMain){btnMain.textContent='⏸ Pause Campaign';btnMain.className='btn btn-y';btnMain.onclick=function(){ctrl('pause')};}
+  if(btnMain){btnMain.innerHTML='⏸ Pause Campaign';btnMain.className='btn btn-y';btnMain.onclick=function(){ctrl('pause')};}
 }
 ['stealth','slow','medium','fast','turbo'].forEach(function(s){
   var el=document.getElementById('sp-'+s);
@@ -8251,7 +8533,29 @@ if(d.running && !d.paused && window.__lastSentForTabs !== d.sent){
 var _tTimer=null;function schedTick(ms){clearTimeout(_tTimer);_tTimer=setTimeout(async function(){await tick();schedTick(window.__lastIsRunning?800:2500)},ms)}schedTick(400);
 
 // ── Controls ──
-async function ctrl(a){try{if(a==='resume'||a==='start'){showToast('🚀 Starting campaign...','info');var b=document.getElementById('btn-ctrl-main');if(b){b.textContent='⚡ Starting...';b.className='btn btn-p';}}else if(a==='pause')showToast('⏸️ Pausing campaign...','warn');else if(a==='stop')showToast('⏹️ Stopping campaign...','error');var r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});var d=await r.json();if(a==='reload')showToast('🔄 Queue reloaded ('+(d.total||0)+' leads ready)','info');else if(a==='resume'||a==='start')showToast('🚀 Campaign started! ('+(d.total||0)+' leads ready)','success');else if(a==='pause')showToast('⏸️ Campaign paused','warn');else if(a==='stop')showToast('⏹️ Campaign stopped','error');await tick();}catch(e){showToast('Error: '+e.message,'error')}}
+async function ctrl(a){
+  try{
+    if(a==='resume'||a==='start'||a==='start_and_lock'||a==='send_and_lock'){
+      showToast('🚀 Starting campaign in Send Mail & Lock mode...','info');
+      var b=document.getElementById('btn-ctrl-main');if(b){b.textContent='⚡ Starting...';b.className='btn btn-p';}
+    }else if(a==='start_bypass_lock'||a==='send_all'){
+      showToast('⚡ Starting campaign (Bypassing 6-Month Lock)...','info');
+      var b=document.getElementById('btn-ctrl-main');if(b){b.textContent='⚡ Starting...';b.className='btn btn-p';}
+    }else if(a==='pause')showToast('⏸️ Pausing campaign...','warn');
+    else if(a==='stop')showToast('⏹️ Stopping campaign...','error');
+    var r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});
+    var d=await r.json();
+    if(a==='reload')showToast('🔄 Queue reloaded ('+(d.total||0)+' leads ready)','info');
+    else if(a==='start_and_lock'||a==='send_and_lock')showToast('🚀 Campaign started in Send Mail & Lock mode! ('+(d.total||0)+' leads)','success');
+    else if(a==='start_bypass_lock'||a==='send_all')showToast('⚡ Campaign started (Bypassing Lock)! ('+(d.total||0)+' leads)','success');
+    else if(a==='instant_lock_all')showToast('🔒 Locked '+(d.count||0)+' queued emails into cooldown!','success');
+    else if(a==='instant_unlock_all')showToast('🔓 Unlocked '+(d.count||0)+' queued emails from cooldown!','success');
+    else if(a==='resume'||a==='start')showToast('🚀 Campaign started! ('+(d.total||0)+' leads ready)','success');
+    else if(a==='pause')showToast('⏸️ Campaign paused','warn');
+    else if(a==='stop')showToast('⏹️ Campaign stopped','error');
+    await tick();
+  }catch(e){showToast('Error: '+e.message,'error')}
+}
 function spd(s){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({speed:s})})}
 function setSpeed(s){spd(s);['stealth','slow','medium','fast','turbo'].forEach(function(x){var el=document.getElementById('sp-'+x);if(el)el.classList.toggle('active',x===s);var elCamp=document.getElementById('camp-sp-'+x);if(elCamp)elCamp.classList.toggle('active',x===s);});}
 function updateCampaignsTabUI(d){
@@ -8291,7 +8595,7 @@ function updateCampaignsTabUI(d){
       btnPause.disabled = true;
       btnPause.className = 'btn btn-ghost';
     } else {
-      btnStart.textContent = '▶ Start Campaign';
+      btnStart.textContent = '🚀 Send Mail & Lock';
       btnStart.className = 'btn btn-g';
       btnPause.disabled = true;
       btnPause.className = 'btn btn-ghost';
@@ -8300,6 +8604,7 @@ function updateCampaignsTabUI(d){
 }
 async function toggleResendMode(){try{var r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'toggleResendMode'})});var d=await r.json();showToast('Resend mode '+(d.resendMode?'ON':'OFF'),'info')}catch(e){showToast('Error: '+e.message,'error')}}
 async function toggleGmailMode(){try{var r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'toggleGmailMode'})});var d=await r.json();var allow=d.allowGmail!==undefined?d.allowGmail:(!d.skipPersonalGmail);showToast('@gmail.com leads '+(allow?'ENABLED (Queue: '+(d.total||0)+' leads)':'DISABLED (Business only)'),allow?'success':'info');var gb=document.getElementById('btn-gmail-mode');if(gb){gb.innerHTML=allow?'&#x2709; @gmail: ON':'&#x2709; @gmail: OFF';gb.className=allow?'btn btn-g':'btn btn-b';}var cgb=document.getElementById('btn-camp-gmail');if(cgb){cgb.textContent=allow?'✉️ @gmail: ON':'✉️ @gmail: OFF';cgb.className=allow?'btn btn-g':'btn btn-b';}var chk=document.getElementById('s-skip-gmail');if(chk)chk.checked=!allow;await tick()}catch(e){showToast('Error: '+e.message,'error')}}
+async function toggleMxShield(){try{var r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'toggleMxShield'})});var d=await r.json();var enabled=d.autoVerifyMxOnSend!==false;showToast('In-Flight DNS/MX Shield '+(enabled?'ENABLED (Verifying Mail Servers)':'DISABLED (Direct Send Mode — No DNS Restrictions)'),enabled?'success':'info');var b=document.getElementById('btn-mx-shield');if(b){b.innerHTML=enabled?'🛡️ DNS Shield: ON':'🛡️ DNS Shield: OFF';b.className=enabled?'btn btn-g':'btn btn-b';}var chk=document.getElementById('s-auto-mx-send');if(chk)chk.checked=enabled;await tick()}catch(e){showToast('Error: '+e.message,'error')}}
 
 function updateAutopilotUI(d){
   var apHdr=document.getElementById('hdr-autopilot-status');
@@ -10033,7 +10338,7 @@ async function quickCampaignPreview(){
     var res = await fetch('/api/campaign/quick-paste', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ emails: area.value, autoStart: false })
+      body: JSON.stringify({ emails: area.value, autoStart: false, mode: 'send_and_lock' })
     });
     var d = await res.json();
     if(!d.ok){
@@ -10047,6 +10352,8 @@ async function quickCampaignPreview(){
     setTxt('qc-cooldown-count', d.summary.cooldownBlocked);
     setTxt('qc-invalid-count', d.summary.invalid);
     setTxt('qc-suppressed-count', d.summary.suppressed);
+    setTxt('qc-btn-ready-cnt', d.summary.ready);
+    setTxt('qc-btn-all-cnt', (d.summary.ready || 0) + (d.summary.cooldownBlocked || 0));
 
     // Cooldown locked list
     var cdList = document.getElementById('qc-cooldown-list');
@@ -10068,11 +10375,14 @@ async function quickCampaignPreview(){
     // Result message
     var msg = document.getElementById('qc-result-msg');
     if(msg){
-      if(d.summary.ready > 0){
-        msg.innerHTML = '✅ <strong>' + d.summary.ready + '</strong> emails ready to send! File saved as <code>' + escHtml(d.savedFile || '—') + '</code>';
+      if(d.summary.ready > 0 && d.summary.cooldownBlocked > 0){
+        msg.innerHTML = '✅ <strong>' + d.summary.ready + '</strong> ready to send with lock &bull; 🔒 <strong>' + d.summary.cooldownBlocked + '</strong> locked. Click <strong>⚡ Send All (Bypass Lock)</strong> to send to all ' + ((d.summary.ready || 0) + (d.summary.cooldownBlocked || 0)) + ', or <strong>🚀 Send Mail &amp; Lock</strong> for ready only.';
+        msg.style.color = 'var(--text-bright)';
+      } else if(d.summary.ready > 0){
+        msg.innerHTML = '✅ <strong>' + d.summary.ready + '</strong> emails ready to send! File will save as <code>' + escHtml(d.savedFile || 'campaign_paste') + '</code>';
         msg.style.color = 'var(--green)';
       } else if(d.summary.cooldownBlocked > 0){
-        msg.innerHTML = '🔒 All pasted emails are in 6-month cooldown. No new emails to send.';
+        msg.innerHTML = '🔒 All ' + d.summary.cooldownBlocked + ' pasted emails are in 6-month cooldown. Click <strong>⚡ Send All (Bypass Lock)</strong> to send anyway, or <strong>🔓 Instant Unlock</strong> to clear the lock.';
         msg.style.color = 'var(--yellow)';
       } else {
         msg.innerHTML = '⚠️ No valid emails found in the paste area.';
@@ -10086,23 +10396,64 @@ async function quickCampaignPreview(){
   }
 }
 
-async function quickCampaignLaunch(autoStart){
+async function quickCampaignAction(action){
   var area = document.getElementById('qc-paste-area');
   if(!area || !area.value.trim()){
     showToast('⚠️ Paste some emails first!', 'warn');
     return;
   }
+  var mode = 'send_and_lock';
+  var autoStart = true;
+  var actionText = 'Processing...';
+
+  if (action === 'send_and_lock') {
+    mode = 'send_and_lock';
+    autoStart = true;
+    actionText = '🚀 Launching ready emails & locking in 6-month cooldown...';
+  } else if (action === 'send_all') {
+    mode = 'send_all';
+    autoStart = true;
+    actionText = '⚡ Launching ALL emails (bypassing 6-month cooldown lock)...';
+  } else if (action === 'instant_lock') {
+    mode = 'instant_lock';
+    autoStart = false;
+    actionText = '🔒 Instantly locking pasted emails into cooldown (no mail sent)...';
+  } else if (action === 'instant_unlock') {
+    mode = 'instant_unlock';
+    autoStart = false;
+    actionText = '🔓 Instantly unlocking pasted emails from cooldown...';
+  } else if (action === 'save_only') {
+    mode = 'send_and_lock';
+    autoStart = false;
+    actionText = '💾 Saving eligible emails to file...';
+  }
+
   try {
-    var actionText = autoStart ? 'Launching campaign...' : 'Saving emails...';
-    showToast('🚀 ' + actionText, 'info');
+    showToast(actionText, 'info');
     var res = await fetch('/api/campaign/quick-paste', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ emails: area.value, autoStart: autoStart })
+      body: JSON.stringify({ emails: area.value, autoStart: autoStart, mode: mode })
     });
     var d = await res.json();
     if(!d.ok){
-      showToast('❌ ' + (d.error || 'Failed'), 'error');
+      showToast('❌ ' + (d.error || 'Operation failed'), 'error');
+      return;
+    }
+
+    if (mode === 'instant_lock') {
+      showToast(d.message || ('🔒 Locked ' + (d.lockedCount || 0) + ' emails!'), 'success');
+      quickCampaignPreview();
+      loadCooldownStatsUI();
+      await tick();
+      return;
+    }
+
+    if (mode === 'instant_unlock') {
+      showToast(d.message || ('🔓 Unlocked ' + (d.unlockedCount || 0) + ' emails!'), 'success');
+      quickCampaignPreview();
+      loadCooldownStatsUI();
+      await tick();
       return;
     }
 
@@ -10113,6 +10464,8 @@ async function quickCampaignLaunch(autoStart){
     setTxt('qc-cooldown-count', d.summary.cooldownBlocked);
     setTxt('qc-invalid-count', d.summary.invalid);
     setTxt('qc-suppressed-count', d.summary.suppressed);
+    setTxt('qc-btn-ready-cnt', d.summary.ready);
+    setTxt('qc-btn-all-cnt', (d.summary.ready || 0) + (d.summary.cooldownBlocked || 0));
 
     // Cooldown locked list
     var cdList = document.getElementById('qc-cooldown-list');
@@ -10135,13 +10488,14 @@ async function quickCampaignLaunch(autoStart){
     var msg = document.getElementById('qc-result-msg');
     if(msg){
       if(d.summary.ready > 0 && autoStart){
-        msg.innerHTML = '🚀 <strong>Campaign launched!</strong> ' + d.summary.ready + ' emails queued from <code>' + escHtml(d.savedFile || '') + '</code>';
+        var note = d.bypassLock ? ' [Bypass Lock — All Sent]' : ' [Send Mail & Lock]';
+        msg.innerHTML = '🚀 <strong>Campaign launched' + note + '!</strong> ' + d.summary.ready + ' emails queued from <code>' + escHtml(d.savedFile || '') + '</code>';
         msg.style.color = 'var(--green)';
       } else if(d.summary.ready > 0){
         msg.innerHTML = '💾 <strong>Saved!</strong> ' + d.summary.ready + ' emails saved to <code>' + escHtml(d.savedFile || '') + '</code>. Start campaign manually when ready.';
         msg.style.color = 'var(--blue)';
       } else if(d.summary.cooldownBlocked > 0){
-        msg.innerHTML = '🔒 All pasted emails are in 6-month cooldown. No new emails to send.';
+        msg.innerHTML = '🔒 All pasted emails are in 6-month cooldown. Click <strong>⚡ Send All (Bypass Lock)</strong> to send anyway, or <strong>🔓 Instant Unlock</strong> to clear the lock.';
         msg.style.color = 'var(--yellow)';
       } else {
         msg.innerHTML = '⚠️ No valid emails found in the paste.';
@@ -10151,23 +10505,23 @@ async function quickCampaignLaunch(autoStart){
 
     if(d.summary.ready > 0){
       if(autoStart){
-        showToast('🚀 Campaign launched! ' + d.summary.ready + ' emails sending (' + d.summary.cooldownBlocked + ' locked)', 'success');
+        showToast('🚀 Campaign launched! ' + d.summary.ready + ' emails sending', 'success');
       } else {
         showToast('💾 ' + d.summary.ready + ' emails saved to ' + (d.savedFile || 'batch'), 'success');
       }
-      // Clear the paste area after successful launch
-      area.value = '';
-      // Refresh dashboard state
       setTimeout(function(){ tick(); }, 1000);
     } else {
-      showToast('🔒 No new emails to send — all in cooldown or invalid', 'warn');
+      showToast('🔒 All in cooldown. Use "⚡ Send All (Bypass Lock)" to send.', 'warn');
     }
 
-    // Refresh cooldown stats
     loadCooldownStatsUI();
   } catch(e){
     showToast('❌ Error: ' + e.message, 'error');
   }
+}
+
+function quickCampaignLaunch(autoStart){
+  return quickCampaignAction(autoStart ? 'send_and_lock' : 'save_only');
 }
 
 async function loadCooldownStatsUI(){
@@ -10209,6 +10563,137 @@ loadCampaignsUI = async function(){
   if(_origLoadCampaignsUI) await _origLoadCampaignsUI();
   loadCooldownStatsUI();
 };
+
+// ══════════ INSTANT LOCK & COOLDOWN CLIENT HELPERS ══════════
+function openInstantLockModal(){
+  var m = document.getElementById('instant-lock-modal');
+  if(m) {
+    m.classList.remove('hidden');
+    var tag = document.getElementById('modal-queue-tag');
+    if(tag && window.__lastStateData) {
+      tag.textContent = (window.__lastStateData.total || 0) + ' Leads Loaded';
+    }
+  }
+}
+
+function closeInstantLockModal(){
+  var m = document.getElementById('instant-lock-modal');
+  if(m) m.classList.add('hidden');
+}
+
+async function submitInstantLockModal(){
+  var area = document.getElementById('modal-lock-emails');
+  var val = area ? area.value.trim() : '';
+  if(!val){
+    showToast('⚠️ Paste some emails to lock first', 'warn');
+    return;
+  }
+  try {
+    showToast('🔒 Instantly locking emails into cooldown...', 'info');
+    var res = await fetch('/api/cooldown/lock', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ emails: val })
+    });
+    var d = await res.json();
+    if(d.ok){
+      showToast('🔒 Successfully locked ' + (d.lockedCount || 0) + ' email(s)!', 'success');
+      if(area) area.value = '';
+      closeInstantLockModal();
+      loadCooldownStatsUI();
+      await tick();
+    } else {
+      showToast('❌ ' + (d.error || 'Lock failed'), 'error');
+    }
+  } catch(e){
+    showToast('❌ Error: ' + e.message, 'error');
+  }
+}
+
+async function submitInstantUnlockModal(){
+  var area = document.getElementById('modal-lock-emails');
+  var val = area ? area.value.trim() : '';
+  if(!val){
+    showToast('⚠️ Paste some emails to unlock first', 'warn');
+    return;
+  }
+  try {
+    showToast('🔓 Instantly unlocking emails from cooldown...', 'info');
+    var res = await fetch('/api/cooldown/unlock', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ emails: val })
+    });
+    var d = await res.json();
+    if(d.ok){
+      showToast('🔓 Successfully unlocked ' + (d.unlockedCount || 0) + ' email(s)!', 'success');
+      if(area) area.value = '';
+      closeInstantLockModal();
+      loadCooldownStatsUI();
+      await tick();
+    } else {
+      showToast('❌ ' + (d.error || 'Unlock failed'), 'error');
+    }
+  } catch(e){
+    showToast('❌ Error: ' + e.message, 'error');
+  }
+}
+
+async function instantLockQueueAll(){
+  if(!confirm('Lock ALL currently queued emails into the 6-month cooldown without sending outbound mail?')) return;
+  await ctrl('instant_lock_all');
+  closeInstantLockModal();
+  loadCooldownStatsUI();
+}
+
+async function instantUnlockQueueAll(){
+  if(!confirm('Unlock ALL currently queued emails from the 6-month cooldown?')) return;
+  await ctrl('instant_unlock_all');
+  closeInstantLockModal();
+  loadCooldownStatsUI();
+}
+
+async function quickLockSingleEmailUI(email){
+  if(!email) return;
+  try {
+    showToast('🔒 Locking ' + email + '...', 'info');
+    var res = await fetch('/api/cooldown/lock', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ email: email })
+    });
+    var d = await res.json();
+    if(d.ok){
+      showToast('🔒 Locked ' + email + ' into 6-month cooldown', 'success');
+      loadCooldownStatsUI();
+      if(typeof loadEmailRecordsUI === 'function') loadEmailRecordsUI();
+      await tick();
+    }
+  } catch(e){
+    showToast('❌ Error: ' + e.message, 'error');
+  }
+}
+
+async function quickUnlockSingleEmailUI(email){
+  if(!email) return;
+  try {
+    showToast('🔓 Unlocking ' + email + '...', 'info');
+    var res = await fetch('/api/cooldown/unlock', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ email: email })
+    });
+    var d = await res.json();
+    if(d.ok){
+      showToast('🔓 Unlocked ' + email + ' from cooldown', 'success');
+      loadCooldownStatsUI();
+      if(typeof loadEmailRecordsUI === 'function') loadEmailRecordsUI();
+      await tick();
+    }
+  } catch(e){
+    showToast('❌ Error: ' + e.message, 'error');
+  }
+}
 
 // ══════════ ACTIVITY & HEALTH CLIENT LOGIC ══════════
 async function loadCampaignHealthUI(){
@@ -10783,6 +11268,8 @@ function renderEmailRecordsTable(list){
       '<td style="text-align:right">' +
         '<div style="display:flex;gap:4px;justify-content:flex-end">' +
           '<button class="btn btn-ghost" data-rec="' + escAttr(r.recipient) + '" data-subj="' + escAttr(r.subject) + '" onclick="previewEmailRecordUI(this.dataset.rec, this.dataset.subj)" style="padding:2px 6px;font-size:11px" title="Preview Email">👁️</button>' +
+          '<button class="btn btn-ghost" data-rec="' + escAttr(r.recipient) + '" onclick="quickLockSingleEmailUI(this.dataset.rec)" style="padding:2px 6px;font-size:11px" title="Instant Lock (Add to 6-Month Cooldown)">🔒</button>' +
+          '<button class="btn btn-ghost" data-rec="' + escAttr(r.recipient) + '" onclick="quickUnlockSingleEmailUI(this.dataset.rec)" style="padding:2px 6px;font-size:11px" title="Instant Unlock (Remove from Cooldown)">🔓</button>' +
           '<button class="btn btn-ghost" data-rec="' + escAttr(r.recipient) + '" onclick="retryEmailRecordUI(this.dataset.rec)" style="padding:2px 6px;font-size:11px;color:var(--yellow)" title="Retry Send">🔄</button>' +
         '</div>' +
       '</td>' +
